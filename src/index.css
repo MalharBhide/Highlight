@@ -1,0 +1,112 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Bricolage Grotesque', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+    --bg-canvas: #f5f2eb;
+    --bg-surface: #ffffff;
+    --bg-subtle: #ebe6dc;
+    --border-hairline: #dcd6ca;
+    --text-primary: #141311;
+    --text-secondary: #57534c;
+    --text-muted: #857f75;
+    --accent-vermilion: #d9381e;
+    --accent-vermilion-hover: #b82d16;
+  }
+
+  .dark {
+    --bg-canvas: #05070a;
+    --bg-surface: #0b0f14;
+    --bg-subtle: #111922;
+    --border-hairline: #1a2634;
+    --text-primary: #ecfeff;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent-vermilion: #06b6d4;
+    --accent-vermilion-hover: #22d3ee;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+    letter-spacing: -0.025em;
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.theme-dark {
+  background-color: #05070a;
+  color: #ecfeff;
+}
+
+.theme-light {
+  background-color: #f5f2eb;
+  color: #141311;
+}
+
+.surface-card-dark {
+  background-color: #0b0f14;
+  border-color: #1a2634;
+  color: #ecfeff;
+}
+
+.surface-card-light {
+  background-color: #ffffff;
+  border-color: #dcd6ca;
+  color: #141311;
+}
+
+.surface-subtle-dark {
+  background-color: #111922;
+  border-color: #1a2634;
+  color: #cffafe;
+}
+
+.surface-subtle-light {
+  background-color: #ebe6dc;
+  border-color: #dcd6ca;
+  color: #141311;
+}
+
+.btn-accent {
+  background-color: var(--accent-vermilion);
+  color: #ffffff;
+  transition: background-color 150ms cubic-bezier(0.16, 1, 0.3, 1), color 150ms cubic-bezier(0.16, 1, 0.3, 1), transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.dark .btn-accent {
+  background-color: #06b6d4;
+  color: #030712;
+}
+
+.btn-accent:hover:not(:disabled) {
+  background-color: var(--accent-vermilion-hover);
+}
+
+.dark .btn-accent:hover:not(:disabled) {
+  background-color: #22d3ee;
+  color: #030712;
+}
+
+.btn-accent:active:not(:disabled) {
+  transform: scale(0.99);
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Highlight",
+  "description": "Watch less. See the best. AI-powered YouTube highlight generator using Google Gemini video understanding, audience engagement signals, and FFmpeg editing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

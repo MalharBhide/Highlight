@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.playwright-cli/
+.data/highlight-storage/uploads/
+.data/highlight-storage/renders/
+.data/highlight-storage/*.mp4
+
