@@ -5,6 +5,7 @@ import {
   Film,
   Plus,
   Search,
+  Trash2,
 } from 'lucide-react';
 import {
   formatTimestamp,
@@ -17,6 +18,7 @@ interface AllReelsViewProps {
   darkMode: boolean;
   recentJobs: RecentJobSummary[];
   onSelectJob: (jobId: string) => void;
+  onDeleteJob?: (jobId: string) => void;
   onBackToWorkspace: () => void;
   onCompileNew: () => void;
 }
@@ -32,6 +34,7 @@ export const AllReelsView: React.FC<AllReelsViewProps> = ({
   darkMode,
   recentJobs,
   onSelectJob,
+  onDeleteJob,
   onBackToWorkspace,
   onCompileNew,
 }) => {
@@ -325,7 +328,7 @@ export const AllReelsView: React.FC<AllReelsViewProps> = ({
                   </div>
 
                   <div
-                    className={`px-5 py-3.5 border-t flex items-center justify-between ${
+                    className={`px-5 py-3.5 border-t flex items-center justify-between gap-2 ${
                       darkMode
                         ? 'border-[#1a2634] bg-[#05070a]'
                         : 'border-[#dcd6ca] bg-[#f5f2eb]/60'
@@ -338,14 +341,30 @@ export const AllReelsView: React.FC<AllReelsViewProps> = ({
                     >
                       Reel length: {formatTimestamp(reelDuration)}
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => onSelectJob(job.id)}
-                      className="btn-accent inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Play className="w-3 h-3 fill-current" />
-                      <span>Watch Video</span>
-                    </button>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {onDeleteJob && (
+                        <button
+                          type="button"
+                          onClick={() => onDeleteJob(job.id)}
+                          title="Delete compiled reel"
+                          className={`p-1.5 rounded-md border transition-colors cursor-pointer ${
+                            darkMode
+                              ? 'border-[#1a2634] text-[#94a3b8] hover:text-[#ecfeff] hover:bg-[#111922]'
+                              : 'border-[#dcd6ca] text-[#57534c] hover:text-[#141311] hover:bg-[#ebe6dc]'
+                          }`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onSelectJob(job.id)}
+                        className="btn-accent inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-md cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <Play className="w-3 h-3 fill-current" />
+                        <span>Watch Video</span>
+                      </button>
+                    </div>
                   </div>
                 </article>
               );

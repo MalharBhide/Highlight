@@ -20,6 +20,11 @@ import {
   type HighlightSegmentRecord,
   type VideoRecord,
 } from './lib/highlightEngine';
+import {
+  getClientHeaders,
+  recordOwnedJobId,
+  removeOwnedJobId,
+} from './lib/clientSession';
 
 type ActiveScreen = 'home' | 'processing' | 'results' | 'reels';
 
@@ -50,7 +55,9 @@ export default function App() {
 
   const fetchRecentJobs = useCallback(async () => {
     try {
-      const jobsRes = await fetch('/api/highlights');
+      const jobsRes = await fetch('/api/highlights', {
+        headers: getClientHeaders(),
+      });
       if (jobsRes.ok) {
         const jobsData = (await jobsRes.json()) as { items?: RecentJobSummary[] };
         setRecentJobs(jobsData.items || []);
@@ -63,7 +70,9 @@ export default function App() {
   const loadJobDetails = useCallback(
     async (jobId: string) => {
       try {
-        const res = await fetch(`/api/highlights/${encodeURIComponent(jobId)}`);
+        const res = await fetch(`/api/highlights/${encodeURIComponent(jobId)}`, {
+          headers: getClientHeaders(),
+        });
         if (!res.ok) {
           setLoadingSharedReel(false);
           setScreen('home');
@@ -79,7 +88,9 @@ export default function App() {
         if (data.job.status === 'complete') {
           let resolvedSegments = data.segments;
           if (!resolvedSegments) {
-            const segRes = await fetch(`/api/highlights/${encodeURIComponent(jobId)}/segments`);
+            const segRes = await fetch(`/api/highlights/${encodeURIComponent(jobId)}/segments`, {
+              headers: getClientHeaders(),
+            });
             if (segRes.ok) {
               const segData = (await segRes.json()) as { segments?: HighlightSegmentRecord[] };
               resolvedSegments = segData.segments || [];
@@ -144,7 +155,7 @@ export default function App() {
     const timer = setTimeout(() => {
       void fetch('/api/videos/inspect', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getClientHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ url: trimmed, keepPercentage }),
       }).catch(() => {
         // ignore pre-warm network errors
@@ -206,7 +217,7 @@ export default function App() {
       setCreatingJob(true);
       const res = await fetch('/api/highlights', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getClientHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           url: raw,
           durationSeconds: customDurationSeconds,
@@ -222,6 +233,7 @@ export default function App() {
       if (!res.ok || !data.job || !data.video) {
         throw new Error(data.error || 'Failed to start highlight generation job.');
       }
+      recordOwnedJobId(data.job.id);
       setActiveJob(data.job);
       setActiveVideo(data.video);
       setActiveSegments([]);
@@ -247,6 +259,7 @@ export default function App() {
 
       const res = await fetch('/api/highlights/upload', {
         method: 'POST',
+        headers: getClientHeaders(),
         body: formData,
       });
       const data = (await res.json()) as {
@@ -257,6 +270,7 @@ export default function App() {
       if (!res.ok || !data.job || !data.video) {
         throw new Error(data.error || 'Failed to upload and compile video file.');
       }
+      recordOwnedJobId(data.job.id);
       setActiveJob(data.job);
       setActiveVideo(data.video);
       setActiveSegments([]);
@@ -272,11 +286,35 @@ export default function App() {
     if (!activeJob) return;
     const res = await fetch(`/api/highlights/${activeJob.id}/retry`, {
       method: 'POST',
+      headers: getClientHeaders(),
     });
     if (res.ok) {
       await loadJobDetails(activeJob.id);
     }
   };
+
+  const handleDeleteJob = useCallback(
+    async (jobId: string) => {
+      try {
+        await fetch(`/api/highlights/${encodeURIComponent(jobId)}`, {
+          method: 'DELETE',
+          headers: getClientHeaders(),
+        });
+      } catch {
+        // ignore network error
+      }
+      removeOwnedJobId(jobId);
+      setRecentJobs((prev) => prev.filter((item) => item.job.id !== jobId));
+      if (activeJob?.id === jobId) {
+        window.history.replaceState(null, '', '/');
+        setActiveJob(null);
+        setActiveVideo(null);
+        setActiveSegments([]);
+        setScreen('home');
+      }
+    },
+    [activeJob?.id]
+  );
 
   const handleNavigateHome = () => {
     window.history.replaceState(null, '', '/');
@@ -349,6 +387,7 @@ export default function App() {
               darkMode={darkMode}
               recentJobs={recentJobs}
               onSelectJob={(jobId) => void loadJobDetails(jobId)}
+              onDeleteJob={(jobId) => void handleDeleteJob(jobId)}
               onOpenAllReels={handleOpenAllReels}
               onFocusTopInput={handleFocusInput}
             />
@@ -360,6 +399,7 @@ export default function App() {
             darkMode={darkMode}
             recentJobs={recentJobs}
             onSelectJob={(jobId) => void loadJobDetails(jobId)}
+            onDeleteJob={(jobId) => void handleDeleteJob(jobId)}
             onBackToWorkspace={handleNavigateHome}
             onCompileNew={handleFocusInput}
           />
@@ -385,6 +425,7 @@ export default function App() {
             onBackToWorkspace={handleNavigateHome}
             onOpenAllReels={handleOpenAllReels}
             onRefreshJob={() => loadJobDetails(activeJob.id)}
+            onDeleteJob={() => void handleDeleteJob(activeJob.id)}
           />
         )}
       </main>

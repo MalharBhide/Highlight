@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Play, ArrowUpRight, ArrowRight, Film } from 'lucide-react';
 import {
   formatTimestamp,
@@ -18,6 +18,7 @@ interface LandingSectionsProps {
   darkMode: boolean;
   recentJobs: RecentJobSummary[];
   onSelectJob: (jobId: string) => void;
+  onDeleteJob?: (jobId: string) => void;
   onOpenAllReels: () => void;
   onFocusTopInput: () => void;
 }
@@ -47,6 +48,8 @@ export const LandingSections: React.FC<LandingSectionsProps> = ({
   onOpenAllReels,
   onFocusTopInput,
 }) => {
+  const [imgErrors, setImgErrors] = useState<Record<string, boolean>>({});
+
   return (
     <>
       {/* Compiled Reels Preview Section */}
@@ -96,11 +99,14 @@ export const LandingSections: React.FC<LandingSectionsProps> = ({
                 >
                   <div className="w-full">
                     <div className="aspect-video w-full bg-[#05070a] relative overflow-hidden border-b border-inherit">
-                      {video?.thumbnail ? (
+                      {!imgErrors[job.id] && video?.thumbnail ? (
                         <img
                           src={video.thumbnail}
                           alt={video.title}
                           referrerPolicy="no-referrer"
+                          onError={() =>
+                            setImgErrors((prev) => ({ ...prev, [job.id]: true }))
+                          }
                           className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
                         />
                       ) : (

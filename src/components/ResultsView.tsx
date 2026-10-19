@@ -10,6 +10,7 @@ import {
   Check,
   Copy,
   ExternalLink,
+  Trash2,
 } from 'lucide-react';
 import {
   formatTimestamp,
@@ -19,6 +20,11 @@ import {
   type HighlightSegmentRecord,
   type VideoRecord,
 } from '../lib/highlightEngine';
+import {
+  getClientHeaders,
+  getOrCreateClientId,
+  getOwnedJobIds,
+} from '../lib/clientSession';
 
 declare global {
   interface Window {
@@ -63,6 +69,7 @@ interface ResultsViewProps {
   onBackToWorkspace: () => void;
   onOpenAllReels: () => void;
   onRefreshJob: () => Promise<void>;
+  onDeleteJob?: () => void;
 }
 
 function formatRoleLabel(seg: HighlightSegmentRecord, duration: number): string {
@@ -103,6 +110,7 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
   onBackToWorkspace,
   onOpenAllReels,
   onRefreshJob,
+  onDeleteJob,
 }) => {
   const videoPlayerRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -121,9 +129,21 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
   const [ytReady, setYtReady] = useState<boolean>(false);
 
   const isMp4Ready = Boolean(job.download_ready && job.source_media_status === 'rendered');
+  const isOwner = useMemo(() => {
+    const clientId = getOrCreateClientId();
+    const ownedSet = getOwnedJobIds();
+    if (ownedSet.has(job.id)) return true;
+    if (!job.owner_client_id) return true;
+    return job.owner_client_id === clientId;
+  }, [job.id, job.owner_client_id]);
+
   const encodedJobId = encodeURIComponent(job.id);
   const shareUrl = `${window.location.origin}/?reel=${encodedJobId}#reel=${encodedJobId}`;
+  const streamVersion = `${job.output_resolution_height || 720}-${Math.round(
+    (job.actual_output_duration || 0) * 100
+  )}`;
   const directMp4Url = `${window.location.origin}/api/highlights/${encodedJobId}/download`;
+  const playbackMp4Url = `${directMp4Url}?v=${streamVersion}`;
 
   useEffect(() => {
     return () => {
@@ -209,9 +229,12 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
 
     try {
       setDownloadingMp4(true);
-      const res = await fetch(`/api/highlights/${encodedJobId}/download?download=1`);
+      const res = await fetch(`/api/highlights/${encodedJobId}/download?download=1`, {
+        headers: getClientHeaders(),
+      });
       if (!res.ok) {
-        throw new Error('Failed to download compiled MP4 video.');
+        const errData = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(errData.error || 'Failed to download compiled MP4 video.');
       }
       const blob = await res.blob();
       const mp4Blob = new Blob([blob], { type: 'video/mp4' });
@@ -401,6 +424,7 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
 
       const sourceRes = await fetch(`/api/highlights/${job.id}/source`, {
         method: 'POST',
+        headers: getClientHeaders(),
         body: formData,
       });
       const sourceData = (await sourceRes.json()) as { error?: string };
@@ -410,6 +434,7 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
 
       const renderRes = await fetch(`/api/highlights/${job.id}/render`, {
         method: 'POST',
+        headers: getClientHeaders(),
       });
       const renderData = (await renderRes.json()) as { error?: string };
       if (!renderRes.ok) {
@@ -494,6 +519,22 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
               )}
             </button>
 
+            {isOwner && onDeleteJob && (
+              <button
+                type="button"
+                onClick={onDeleteJob}
+                title="Delete this compiled video"
+                className={`inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs sm:text-sm font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  darkMode
+                    ? 'bg-[#0b0f14] border-[#1a2634] text-[#94a3b8] hover:text-[#ecfeff] hover:border-[#22d3ee]/50'
+                    : 'bg-white border-[#dcd6ca] text-[#57534c] hover:text-[#141311] hover:bg-[#ebe6dc]'
+                }`}
+              >
+                <Trash2 className="w-4 h-4" />
+                <span className="hidden sm:inline">Delete</span>
+              </button>
+            )}
+
             <input
               ref={fileInputRef}
               id="source-video-upload"
@@ -509,36 +550,38 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
               }}
             />
 
-            {isMp4Ready ? (
-              <button
-                type="button"
-                data-testid="download-mp4-button"
-                data-download-filename={downloadFilename}
-                disabled={downloadingMp4}
-                onClick={() => void handleDownloadMp4()}
-                className="btn-accent inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold rounded-md whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-              >
-                {downloadingMp4 ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Download className="w-4 h-4" />
-                )}
-                <span>{downloadingMp4 ? 'Downloading...' : 'Download Video (.MP4)'}</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                disabled={uploadingOrRendering}
-                onClick={() => fileInputRef.current?.click()}
-                className="btn-accent inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold rounded-md cursor-pointer disabled:opacity-50"
-              >
-                {uploadingOrRendering ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Upload className="w-4 h-4" />
-                )}
-                <span>{uploadingOrRendering ? 'Compiling Video...' : 'Compile .MP4 from File'}</span>
-              </button>
+            {isOwner && (
+              isMp4Ready ? (
+                <button
+                  type="button"
+                  data-testid="download-mp4-button"
+                  data-download-filename={downloadFilename}
+                  disabled={downloadingMp4}
+                  onClick={() => void handleDownloadMp4()}
+                  className="btn-accent inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold rounded-md whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                >
+                  {downloadingMp4 ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  <span>{downloadingMp4 ? 'Downloading...' : 'Download Video (.MP4)'}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={uploadingOrRendering}
+                  onClick={() => fileInputRef.current?.click()}
+                  className="btn-accent inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold rounded-md cursor-pointer disabled:opacity-50"
+                >
+                  {uploadingOrRendering ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Upload className="w-4 h-4" />
+                  )}
+                  <span>{uploadingOrRendering ? 'Compiling Video...' : 'Compile .MP4 from File'}</span>
+                </button>
+              )
             )}
           </div>
         </div>
@@ -664,10 +707,12 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
           <div className="aspect-video w-full bg-black relative">
             {isMp4Ready ? (
               <video
+                key={playbackMp4Url}
                 ref={videoPlayerRef}
                 data-testid="rendered-mp4-player"
-                src={directMp4Url}
+                src={playbackMp4Url}
                 controls
+                controlsList={isOwner ? undefined : 'nodownload'}
                 autoPlay
                 playsInline
                 preload="auto"

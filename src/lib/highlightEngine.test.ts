@@ -15,6 +15,11 @@ import {
   selectHighlightReel,
   verifySourceMediaDuration,
   computeClipRenderSignature,
+  sanitizeClientId,
+  isJobVisibleToClient,
+  selectTargetOutputResolution,
+  snapStartToBoundary,
+  snapEndToBoundary,
 } from './highlightEngine.ts';
 
 test('extractYouTubeVideoId validates standard, short, and shorts URLs and rejects invalid ones', () => {
@@ -417,5 +422,120 @@ test('computeClipRenderSignature generates deterministic cache keys and distingu
   assert.equal(sig1, sig2);
   assert.notEqual(sig1, sigDifferentPct);
   assert.notEqual(sig1, sigDifferentCut);
+});
+
+test('sanitizeClientId and isJobVisibleToClient enforce strict per-user video isolation', () => {
+  assert.equal(sanitizeClientId('client-9f8a7b6c-1234-5678'), 'client-9f8a7b6c-1234-5678');
+  assert.equal(sanitizeClientId('short'), null);
+  assert.equal(sanitizeClientId('invalid spaces or $ymbols!'), null);
+  assert.equal(sanitizeClientId(null), null);
+
+  const userAJob = { owner_client_id: 'client-user-a-12345678' };
+  const unownedJob = { owner_client_id: undefined };
+
+  assert.equal(isJobVisibleToClient(userAJob, 'client-user-a-12345678'), true);
+  assert.equal(isJobVisibleToClient(userAJob, 'client-user-b-87654321'), false);
+  assert.equal(isJobVisibleToClient(userAJob, null), false);
+  assert.equal(isJobVisibleToClient(unownedJob, 'client-user-a-12345678'), false);
+});
+
+test('selectTargetOutputResolution preserves 1080p Full HD and uses high bitrate without duration throttling', () => {
+  const fullHd = selectTargetOutputResolution(1920, 1080);
+  assert.equal(fullHd.width, 1920);
+  assert.equal(fullHd.height, 1080);
+  assert.equal(fullHd.label, '1080p Full HD');
+  assert.ok(fullHd.targetMaxBitrateKbps >= 8000);
+
+  const hd720 = selectTargetOutputResolution(1280, 720);
+  assert.equal(hd720.width, 1280);
+  assert.equal(hd720.height, 720);
+  assert.equal(hd720.label, '720p HD');
+  assert.ok(hd720.targetMaxBitrateKbps >= 5000);
+});
+
+test('snapStartToBoundary and snapEndToBoundary preserve setup lead-in and payoff completion', () => {
+  // When boundaries exist equidistant before and after, start prefers earlier and end prefers later
+  const startSnapped = snapStartToBoundary(50.0, [49.2, 50.7], 1.8, 0.8);
+  assert.equal(startSnapped, 49.2);
+
+  const endSnapped = snapEndToBoundary(80.0, [79.3, 80.8], 1.8, 0.8);
+  assert.equal(endSnapped, 80.8);
+});
+
+test('selectHighlightReel coalesces micro-gaps between adjacent highlight segments to prevent jump cuts', () => {
+  const candidates = scoreAndMergeCandidates(
+    [
+      {
+        start_time: 0,
+        end_time: 10,
+        title: 'Intro Hook',
+        description: 'Opening hook',
+        role: 'intro',
+        semantic_score: 0.9,
+        visual_score: 0.85,
+        audio_score: 0.8,
+        context_score: 0.92,
+        reason: 'Strong opening setup',
+      },
+      {
+        start_time: 100,
+        end_time: 118,
+        title: 'Core Exchange Part 1',
+        description: 'Setup of the main demonstration',
+        role: 'highlight',
+        semantic_score: 0.92,
+        visual_score: 0.88,
+        audio_score: 0.86,
+        context_score: 0.9,
+        reason: 'Setup of key demonstration',
+      },
+      {
+        start_time: 119.8,
+        end_time: 138,
+        title: 'Core Exchange Payoff',
+        description: 'Immediate payoff 1.8s later',
+        role: 'highlight',
+        semantic_score: 0.96,
+        visual_score: 0.92,
+        audio_score: 0.91,
+        context_score: 0.94,
+        reason: 'Immediate climax after 1.8s breath',
+      },
+      {
+        start_time: 260,
+        end_time: 282,
+        title: 'Second Highlight',
+        description: 'Another strong segment',
+        role: 'highlight',
+        semantic_score: 0.89,
+        visual_score: 0.85,
+        audio_score: 0.84,
+        context_score: 0.88,
+        reason: 'High engagement moment',
+      },
+      {
+        start_time: 388,
+        end_time: 400,
+        title: 'Closing Wrap-Up',
+        description: 'Outro sign-off',
+        role: 'outro',
+        semantic_score: 0.88,
+        visual_score: 0.82,
+        audio_score: 0.8,
+        context_score: 0.91,
+        reason: 'Clean conclusion',
+      },
+    ],
+    [],
+    {
+      engagementAvailable: false,
+      audioAvailable: true,
+      videoDuration: 400,
+    }
+  );
+
+  const reel = selectHighlightReel(candidates, 400, undefined, 22);
+  const coalesced = reel.find((s) => s.start_time <= 100.5 && s.end_time >= 137.5);
+  assert.ok(coalesced, 'Expected adjacent highlight clips separated by 1.8s micro-gap to coalesce into one continuous scene');
 });
 

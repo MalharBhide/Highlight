@@ -62,6 +62,9 @@ export interface HighlightJobRecord {
   video_category?: string;
   analysis_mode?: 'gemini_live' | 'development_fixture';
   engagement_timeline?: EngagementPoint[];
+  owner_client_id?: string;
+  output_resolution_width?: number;
+  output_resolution_height?: number;
   error?: string;
   created_at: string;
 }
@@ -1030,8 +1033,14 @@ export function scoreAndMergeCandidates(
   return deduplicated
     .map((c) => {
       const nonAudioMean = (c.semantic_score + c.visual_score + c.context_score) / 3;
+      const narrativeCore = Math.max(c.semantic_score, c.context_score);
+      const audioExcess = Math.max(0, c.audio_score - narrativeCore);
       const loudnessOnlyPenalty =
-        c.audio_score > 0.75 && nonAudioMean < 0.45 ? 0.65 : 1.0;
+        c.audio_score > 0.75 && nonAudioMean < 0.45
+          ? 0.65
+          : audioExcess > 0.32
+          ? Math.max(0.72, 1 - (audioExcess - 0.32) * 0.65)
+          : 1.0;
 
       const aiTotalWeight = wSemantic + wVisual + wAudio + wContext;
       const ai_score =
@@ -1086,6 +1095,60 @@ function snapToBoundary(time: number, boundaries: number[], maxSnapSeconds = 2.0
 }
 
 /**
+ * Context-preserving start boundary snapping:
+ * Prefers snapping slightly earlier (lead-in pause/cut before speech starts)
+ * so the opening words of a sentence or setup are never clipped.
+ */
+export function snapStartToBoundary(
+  time: number,
+  boundaries: number[],
+  maxBeforeSeconds = 1.9,
+  maxAfterSeconds = 0.75
+): number {
+  if (!boundaries || boundaries.length === 0) return time;
+  let best = time;
+  let bestCost = Infinity;
+  for (const b of boundaries) {
+    const delta = b - time; // negative = earlier than time, positive = later than time
+    if (delta < -maxBeforeSeconds || delta > maxAfterSeconds) continue;
+    // Slight preference for snapping earlier (before speech starts) over cutting into speech
+    const directionalCost = delta <= 0 ? Math.abs(delta) * 0.85 : delta * 1.35;
+    if (directionalCost < bestCost) {
+      bestCost = directionalCost;
+      best = b;
+    }
+  }
+  return best;
+}
+
+/**
+ * Context-preserving end boundary snapping:
+ * Prefers snapping slightly later (pause/cut after sentence completion or payoff)
+ * so punchlines and concluding remarks are never cut off mid-thought.
+ */
+export function snapEndToBoundary(
+  time: number,
+  boundaries: number[],
+  maxAfterSeconds = 1.9,
+  maxBeforeSeconds = 0.75
+): number {
+  if (!boundaries || boundaries.length === 0) return time;
+  let best = time;
+  let bestCost = Infinity;
+  for (const b of boundaries) {
+    const delta = b - time; // positive = later than time, negative = earlier than time
+    if (delta > maxAfterSeconds || delta < -maxBeforeSeconds) continue;
+    // Slight preference for snapping later (after speech completes) over cutting off early
+    const directionalCost = delta >= 0 ? delta * 0.85 : Math.abs(delta) * 1.35;
+    if (directionalCost < bestCost) {
+      bestCost = directionalCost;
+      best = b;
+    }
+  }
+  return best;
+}
+
+/**
  * Selects the final highlight reel:
  * - Always incorporates the best Intro clip (if present) and best Outro clip (if present)
  * - Prioritizes the highest-scoring Best Moments across the body of the video
@@ -1117,11 +1180,14 @@ export function selectHighlightReel(
   const refined = candidates
     .filter((c) => c.combined_score >= 0.35)
     .map((c) => {
-      let s = c.start_time <= 0.1 ? c.start_time : snapToBoundary(c.start_time, allBoundaries, 1.8);
+      let s =
+        c.start_time <= 0.1
+          ? c.start_time
+          : snapStartToBoundary(c.start_time, allBoundaries, 1.8, 0.8);
       let e =
         c.end_time >= videoDuration - 0.1
           ? c.end_time
-          : snapToBoundary(c.end_time, allBoundaries, 1.8);
+          : snapEndToBoundary(c.end_time, allBoundaries, 1.8, 0.8);
       s = Math.max(0, Math.min(videoDuration, s));
       e = Math.max(0, Math.min(videoDuration, e));
       if (e - s < minClip) {
@@ -1181,10 +1247,11 @@ export function selectHighlightReel(
       intro.duration > maxIntroDur
         ? {
             ...intro,
-            end_time: intro.start_time + maxIntroDur,
+            end_time: snapEndToBoundary(intro.start_time + maxIntroDur, allBoundaries, 1.2, 0.8),
             duration: maxIntroDur,
           }
         : intro;
+    clampedIntro.duration = clampedIntro.end_time - clampedIntro.start_time;
     if (canAddClip(clampedIntro)) {
       commitClip(clampedIntro);
     }
@@ -1201,10 +1268,14 @@ export function selectHighlightReel(
       outro.duration > maxOutroDur
         ? {
             ...outro,
-            start_time: Math.max(0, outro.end_time - maxOutroDur),
+            start_time: Math.max(
+              0,
+              snapStartToBoundary(outro.end_time - maxOutroDur, allBoundaries, 1.2, 0.8)
+            ),
             duration: maxOutroDur,
           }
         : outro;
+    clampedOutro.duration = clampedOutro.end_time - clampedOutro.start_time;
     if (canAddClip(clampedOutro)) {
       commitClip(clampedOutro);
     }
@@ -1215,12 +1286,24 @@ export function selectHighlightReel(
     (c) => !selected.some((s) => s.start_time === c.start_time && s.end_time === c.end_time)
   );
 
+  const computeSynergyBonus = (c: (typeof refined)[number]) => {
+    const narrative = 0.6 * c.semantic_score + 0.4 * c.context_score;
+    const sensory = Math.max((c.visual_score + c.audio_score) / 2, c.engagement_score);
+    return narrative >= 0.76 && sensory >= 0.74
+      ? Math.min(0.035, (narrative - 0.72) * (sensory - 0.7) * 0.4)
+      : 0;
+  };
+
   while (remaining.length > 0 && accumulatedDuration < targetSeconds) {
     remaining.sort((a, b) => {
       const qA = Math.min(3, Math.floor((a.start_time / Math.max(1, videoDuration)) * 4));
       const qB = Math.min(3, Math.floor((b.start_time / Math.max(1, videoDuration)) * 4));
-      const bonusA = quarterCounts[qA] === 0 ? 0.06 : 0;
-      const bonusB = quarterCounts[qB] === 0 ? 0.06 : 0;
+      const bonusA =
+        (quarterCounts[qA] === 0 ? 0.065 : quarterCounts[qA] === 1 ? 0.02 : 0) +
+        computeSynergyBonus(a);
+      const bonusB =
+        (quarterCounts[qB] === 0 ? 0.065 : quarterCounts[qB] === 1 ? 0.02 : 0) +
+        computeSynergyBonus(b);
       return b.combined_score + bonusB - (a.combined_score + bonusA);
     });
 
@@ -1233,7 +1316,7 @@ export function selectHighlightReel(
       const needed = targetSeconds - accumulatedDuration;
       if (needed >= minClip) {
         const rawEnd = Math.min(videoDuration, next.start_time + needed);
-        const snappedEnd = snapToBoundary(rawEnd, allBoundaries, 1.2);
+        const snappedEnd = snapEndToBoundary(rawEnd, allBoundaries, 1.2, 0.8);
         const snappedDur = snappedEnd - next.start_time;
         const finalEnd =
           snappedDur >= minClip &&
@@ -1266,7 +1349,45 @@ export function selectHighlightReel(
   // Sort chronologically by start_time so Intro is first, Best Moments are middle, and Outro is last
   selected.sort((a, b) => a.start_time - b.start_time);
 
-  // Fine-tune selected clips into available non-overlapping timeline gaps if accumulatedDuration is short of targetSeconds
+  // Step 4: Coalesce adjacent clips separated by a tiny micro-gap (<= 2.5s) to prevent jarring jump cuts
+  const maxMicroGap = Math.min(2.5, videoDuration * 0.008);
+  if (selected.length > 2 && maxMicroGap > 0.2) {
+    let i = 0;
+    while (i < selected.length - 1 && selected.length > 2) {
+      const curr = selected[i];
+      const next = selected[i + 1];
+      const gap = next.start_time - curr.end_time;
+      if (
+        gap >= 0 &&
+        gap <= maxMicroGap &&
+        accumulatedDuration + gap <= maxSeconds &&
+        curr.role !== 'intro' &&
+        next.role !== 'outro'
+      ) {
+        const keepNextMeta = next.combined_score > curr.combined_score;
+        curr.end_time = next.end_time;
+        curr.duration = curr.end_time - curr.start_time;
+        if (keepNextMeta) {
+          curr.title = next.title;
+          curr.description = next.description;
+          curr.reason = next.reason;
+        }
+        curr.semantic_score = Math.max(curr.semantic_score, next.semantic_score);
+        curr.visual_score = Math.max(curr.visual_score, next.visual_score);
+        curr.audio_score = Math.max(curr.audio_score, next.audio_score);
+        curr.context_score = Math.max(curr.context_score, next.context_score);
+        curr.ai_score = Math.max(curr.ai_score, next.ai_score);
+        curr.engagement_score = Math.max(curr.engagement_score, next.engagement_score);
+        curr.combined_score = Math.max(curr.combined_score, next.combined_score);
+        accumulatedDuration += gap;
+        selected.splice(i + 1, 1);
+      } else {
+        i++;
+      }
+    }
+  }
+
+  // Step 5: Fine-tune selected clips into available non-overlapping timeline gaps if accumulatedDuration is short of targetSeconds
   if (selected.length > 0 && targetSeconds - accumulatedDuration > 0.35) {
     for (let pass = 0; pass < 3 && targetSeconds - accumulatedDuration > 0.25; pass++) {
       const deficit = targetSeconds - accumulatedDuration;
@@ -1395,6 +1516,63 @@ export function computeClipRenderSignature(
   const clipKey = segments
     .map((s) => `${s.start_time.toFixed(3)}-${s.end_time.toFixed(3)}`)
     .join('|');
-  return `${videoId}::${validPct}::${clipKey}`;
+  return `${videoId}::${validPct}::${clipKey}::hq-v2`;
 }
 
+/**
+ * Validates and normalizes a per-browser client session token so each user's videos
+ * remain isolated to their own device and are never saved or listed for other users.
+ */
+export function sanitizeClientId(rawClientId: unknown): string | null {
+  if (typeof rawClientId !== 'string') return null;
+  const trimmed = rawClientId.trim();
+  if (!/^[A-Za-z0-9_-]{8,80}$/.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+/**
+ * Determines whether a compiled highlight job belongs to the requesting browser client.
+ * Jobs without an explicit matching owner_client_id are never exposed in another user's library.
+ */
+export function isJobVisibleToClient(
+  job: Pick<HighlightJobRecord, 'owner_client_id'>,
+  requestClientId: string | null | undefined
+): boolean {
+  const validClient = sanitizeClientId(requestClientId);
+  const validOwner = sanitizeClientId(job.owner_client_id);
+  if (!validClient || !validOwner) {
+    return false;
+  }
+  return validClient === validOwner;
+}
+
+/**
+ * Selects high-definition output dimensions and target encoding bitrate
+ * without duration-based bitrate throttling.
+ */
+export function selectTargetOutputResolution(
+  sourceWidth: number,
+  sourceHeight: number
+): {
+  width: number;
+  height: number;
+  label: '1080p Full HD' | '720p HD';
+  targetMaxBitrateKbps: number;
+} {
+  if (sourceHeight >= 1080 || sourceWidth >= 1920) {
+    return {
+      width: 1920,
+      height: 1080,
+      label: '1080p Full HD',
+      targetMaxBitrateKbps: 8500,
+    };
+  }
+  return {
+    width: 1280,
+    height: 720,
+    label: '720p HD',
+    targetMaxBitrateKbps: 6000,
+  };
+}

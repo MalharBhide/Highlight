@@ -24,6 +24,9 @@ import {
   computeClipRenderSignature,
   classifySegmentRole,
   formatTimestamp,
+  sanitizeClientId,
+  isJobVisibleToClient,
+  selectTargetOutputResolution,
   type VideoRecord,
   type HighlightJobRecord,
   type HighlightSegmentRecord,
@@ -38,10 +41,9 @@ dotenv.config();
 
 const execFileAsync = promisify(execFile);
 
-const STORAGE_DIR =
-  process.env.STORAGE_DIR || path.join(process.cwd(), '.data', 'highlight-storage');
 const MEDIA_STORAGE_DIR =
   process.env.MEDIA_STORAGE_DIR || path.join(os.tmpdir(), 'highlight-storage');
+const STORAGE_DIR = process.env.STORAGE_DIR || MEDIA_STORAGE_DIR;
 const UPLOADS_DIR = path.join(MEDIA_STORAGE_DIR, 'uploads');
 const RENDERS_DIR = path.join(MEDIA_STORAGE_DIR, 'renders');
 const DB_FILE = path.join(STORAGE_DIR, 'db.json');
@@ -52,6 +54,30 @@ const FIXTURE_MP4_PATH = path.join(MEDIA_STORAGE_DIR, 'fixture-keynote-300s.mp4'
 fs.mkdirSync(STORAGE_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(RENDERS_DIR, { recursive: true });
+
+const NOTUBE_MIRROR_NUMBERS = [
+  40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
+  59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
+];
+
+function pickNotubeMirrors(count = 6): string[] {
+  const pool = [...NOTUBE_MIRROR_NUMBERS];
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, count).map((n) => `https://s${n}.notube.net`);
+}
+
+function extractRequestClientId(req: express.Request): string | null {
+  const headerVal = req.headers['x-client-id'];
+  const rawHeader = Array.isArray(headerVal) ? headerVal[0] : headerVal;
+  return (
+    sanitizeClientId(rawHeader) ||
+    sanitizeClientId(req.query?.clientId) ||
+    sanitizeClientId(req.body?.clientId)
+  );
+}
 
 interface DatabaseState {
   videos: Record<string, VideoRecord>;
@@ -73,8 +99,12 @@ function loadDb(): DatabaseState {
       const raw = fs.readFileSync(DB_FILE, 'utf-8');
       const parsed = JSON.parse(raw) as DatabaseState;
       for (const [id, job] of Object.entries(parsed.jobs || {})) {
-        if (job.status === 'failed') {
+        // Purge failed jobs or legacy unowned jobs so another user's videos are never exposed globally
+        if (job.status === 'failed' || !sanitizeClientId(job.owner_client_id)) {
           delete parsed.jobs[id];
+          if (parsed.segments) {
+            delete parsed.segments[id];
+          }
           continue;
         }
         if (job.download_location) {
@@ -86,15 +116,20 @@ function loadDb(): DatabaseState {
             : normalizeMediaFilePath(job.source_media_path, UPLOADS_DIR);
         }
       }
-      for (const video of Object.values(parsed.videos || {})) {
+      const referencedVideos = new Set(Object.values(parsed.jobs || {}).map((j) => j.video_id));
+      for (const [vidId, video] of Object.entries(parsed.videos || {})) {
+        if (!referencedVideos.has(vidId)) {
+          delete parsed.videos[vidId];
+          continue;
+        }
         if (video.title.includes('(Dev Fixture)')) {
           video.title = video.title.replace(/\s*\(Dev Fixture\)/g, '');
         }
       }
       return parsed;
     }
-  } catch (err) {
-    console.error('Failed to read DB file, initializing fresh store:', err);
+  } catch {
+    // Initialize fresh store if DB file is unreadable
   }
   return { videos: {}, jobs: {}, segments: {} };
 }
@@ -104,133 +139,15 @@ const db: DatabaseState = loadDb();
 function saveDb(): void {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Failed to persist DB file:', err);
+  } catch {
+    // ignore transient write error
   }
 }
 
 function seedInitialReelsIfNeeded(): void {
-  try {
-    const allSegs = Object.values(db.segments).flat();
-    const hasTruncatedSeed = allSegs.some(
-      (s) => s.title.endsWith('Lab Fie') || s.title.endsWith('Key')
-    );
-    const hasRoundedSeed =
-      db.videos['vid-dev-keynote-01']?.duration === 300 ||
-      db.videos['vid-dev-robotics-02']?.duration === 600 ||
-      db.videos['vid-dev-robotics-02']?.title?.startsWith('Autonomous');
-    const completedCount = Object.values(db.jobs).filter((j) => j.status === 'complete').length;
-    if (completedCount > 0 && !hasTruncatedSeed && !hasRoundedSeed) return;
-
-    const fixtureKeys = ['dev-keynote-01', 'dev-robotics-02'];
-    fixtureKeys.forEach((key, index) => {
-      const fixture = DEVELOPMENT_FIXTURES[key];
-      if (!fixture) return;
-      const video: VideoRecord = {
-        ...fixture.video,
-        title: fixture.video.title.replace(/\s*\(Dev Fixture\)/g, ''),
-      };
-      db.videos[video.id] = video;
-
-      const shortHeading = video.title.split(':')[0].trim();
-      const target = calculateTargetDuration(video.duration);
-      const introEnd =
-        fixture.sceneBoundaries.find((b) => b > 5 && b <= target.targetSeconds * 0.2) ??
-        target.targetSeconds * 0.143;
-      const outroStart =
-        [...fixture.sceneBoundaries]
-          .reverse()
-          .find((b) => b < video.duration - 5 && b >= video.duration - target.targetSeconds * 0.22) ??
-        video.duration - target.targetSeconds * 0.132;
-
-      const introOutroCandidates: AICandidateHighlight[] = [
-        {
-          start_time: 0,
-          end_time: introEnd,
-          title: `Intro — ${shortHeading}`,
-          description: `Opening introduction establishing the speaker, setting, and core premise of ${video.title}.`,
-          semantic_score: 0.9,
-          visual_score: 0.85,
-          audio_score: 0.84,
-          context_score: 0.96,
-          role: 'intro',
-          reason: 'Opening introduction incorporated to ground the highlight reel.',
-        },
-        ...fixture.aiHighlights.map((h) => ({ ...h, role: 'highlight' as const })),
-        {
-          start_time: outroStart,
-          end_time: video.duration,
-          title: `Outro — Final Conclusion & Sign-Off`,
-          description: `Closing wrap-up and final takeaway from ${video.channel}.`,
-          semantic_score: 0.89,
-          visual_score: 0.83,
-          audio_score: 0.83,
-          context_score: 0.95,
-          role: 'outro',
-          reason: 'Closing outro incorporated to give the compiled reel a complete ending.',
-        },
-      ];
-
-      const clamped = validateAndClampAICandidates(
-        {
-          video_summary: fixture.videoSummary,
-          video_category: fixture.videoCategory,
-          highlights: introOutroCandidates,
-        },
-        video.duration
-      );
-      const covered = ensureCandidateCoverageForTarget(clamped.highlights, video.duration);
-      const engagementAnalysis = analyzeEngagementTimeline(
-        fixture.engagementObservations,
-        video.duration
-      );
-      const scored = scoreAndMergeCandidates(covered, engagementAnalysis.peaks || [], {
-        engagementAvailable: fixture.engagementAvailable,
-        audioAvailable: true,
-        videoDuration: video.duration,
-      });
-      const selected = selectHighlightReel(scored, video.duration, {
-        pauseBoundaries: fixture.sceneBoundaries,
-      });
-
-      const jobId = `job-seed-${key}`;
-      const actualDuration = selected.reduce(
-        (sum, seg) => sum + Math.max(0, seg.end_time - seg.start_time),
-        0
-      );
-
-      db.jobs[jobId] = {
-        id: jobId,
-        video_id: video.id,
-        status: 'complete',
-        stage_index: 8,
-        stage_message: 'Highlight video compiled and ready to watch or download.',
-        progress: 100,
-        engagement_available: fixture.engagementAvailable,
-        engagement_source: fixture.engagementSource,
-        source_media_status: 'fixture_ready',
-        rights_confirmed: true,
-        target_duration: target.targetSeconds,
-        actual_output_duration: actualDuration,
-        video_summary: fixture.videoSummary,
-        video_category: fixture.videoCategory,
-        created_at: new Date(Date.now() - (fixtureKeys.length - index) * 60000).toISOString(),
-      };
-
-      db.segments[jobId] = selected.map((seg, idx) => ({
-        id: `seg-${jobId}-${idx + 1}`,
-        job_id: jobId,
-        ...seg,
-        role: seg.role || classifySegmentRole(seg, video.duration),
-      }));
-    });
-
-    saveDb();
-  } catch (err) {
-    console.warn('Initial reel seeding warning:', err);
-  }
+  // Intentionally disabled: user-compiled videos are strictly scoped per browser client ID
+  // so no user's videos are ever pre-populated or saved onto another user's computer.
 }
-
 seedInitialReelsIfNeeded();
 
 function hasValidEnvKey(val: string | undefined, placeholder: string): boolean {
@@ -336,15 +253,19 @@ export async function ensureFixtureSourceVideo(): Promise<string> {
         '-c:v',
         'libx264',
         '-preset',
-        'ultrafast',
+        'veryfast',
         '-crf',
-        '19',
+        '18',
+        '-maxrate',
+        '2500k',
+        '-bufsize',
+        '5000k',
         '-pix_fmt',
         'yuv420p',
         '-c:a',
         'aac',
         '-b:a',
-        '128k',
+        '192k',
         '-shortest',
         tmpOut,
       ]);
@@ -453,8 +374,8 @@ async function fetchEngagementData(
           };
         }
       }
-    } catch (err) {
-      console.warn('YouTube Analytics API query failed, continuing with Gemini AI analysis:', err);
+    } catch {
+      // Fallback to Gemini AI + FFmpeg audio signal analysis when YouTube Analytics is unavailable
     }
   }
 
@@ -680,7 +601,7 @@ async function inspectYouTubeVideo(
 
   if (!detectedDuration) {
     try {
-      const mirrors = ['https://s64.notube.net', 'https://s61.notube.net', 'https://s59.notube.net'];
+      const mirrors = pickNotubeMirrors(4);
       const weightDur = await Promise.any(
         mirrors.map(async (mirror) => {
           const weightRes = await fetch(`${mirror}/recover_weight.php`, {
@@ -689,7 +610,7 @@ async function inspectYouTubeVideo(
               'Content-Type': 'application/x-www-form-urlencoded',
               'User-Agent': 'Mozilla/5.0',
             },
-            body: `url=${encodeURIComponent(canonicalUrl)}&format=mp4&lang=en`,
+            body: `url=${encodeURIComponent(canonicalUrl)}&format=mp4hd&lang=en&subscribed=false`,
             signal: AbortSignal.timeout(7000),
           });
           if (!weightRes.ok) throw new Error('Mirror failed');
@@ -848,8 +769,7 @@ async function extractRawAudioSignals(filePath: string): Promise<RawAudioSignals
       rawAudioSignalsCache[cacheKey] = raw;
       saveAudioSignalsCache();
       return raw;
-    } catch (err) {
-      console.warn('FFmpeg source media signal extraction warning:', err);
+    } catch {
       return null;
     } finally {
       activeAudioSignalExtractions.delete(cacheKey);
@@ -935,6 +855,8 @@ async function analyzeSourceMediaSignals(
     }[] = [];
 
     if (rmsSamples.length >= 10) {
+      const globalMean =
+        rmsSamples.reduce((acc, s) => acc + s.norm, 0) / Math.max(1, rmsSamples.length);
       const stepSec = Math.max(1.5, videoDuration * 0.006);
       for (
         let center = bodyStart + baseWindow * 0.5;
@@ -945,6 +867,14 @@ async function analyzeSourceMediaSignals(
           (s) => s.time >= center - baseWindow * 0.65 && s.time <= center + baseWindow * 0.65
         );
         if (localSamples.length < 3) continue;
+
+        const surroundingSamples = rmsSamples.filter(
+          (s) => s.time >= center - baseWindow * 2.2 && s.time <= center + baseWindow * 2.2
+        );
+        const localBaseline =
+          surroundingSamples.length > 0
+            ? surroundingSamples.reduce((acc, s) => acc + s.norm, 0) / surroundingSamples.length
+            : globalMean;
 
         let sum = 0;
         let maxE = 0;
@@ -960,14 +890,16 @@ async function analyzeSourceMediaSignals(
         }
         const meanEnergy = sum / localSamples.length;
         const dynamicRange = maxE - minE;
-        const score = meanEnergy * 0.65 + dynamicRange * 0.35;
+        const localProminence = Math.max(0, maxE - localBaseline);
+        const score =
+          meanEnergy * 0.45 + dynamicRange * 0.3 + Math.min(1, localProminence * 1.6) * 0.25;
 
         const naturalSpan = baseWindow * (0.72 + 0.58 * score);
         const rawStart = Math.max(bodyStart, peakTime - naturalSpan * 0.43);
         const rawEnd = Math.min(bodyEnd, rawStart + naturalSpan);
 
-        const alignedStart = nearestPause(rawStart, naturalSpan * 0.22);
-        const alignedEnd = nearestPause(rawEnd, naturalSpan * 0.22);
+        const alignedStart = nearestPause(rawStart, naturalSpan * 0.24);
+        const alignedEnd = nearestPause(rawEnd, naturalSpan * 0.24);
         const finalStart = Math.max(bodyStart, alignedStart);
         const finalEnd =
           alignedEnd - finalStart >= baseWindow * 0.45
@@ -1018,8 +950,7 @@ async function analyzeSourceMediaSignals(
       introEnd,
       outroStart,
     };
-  } catch (err) {
-    console.warn('FFmpeg source media signal analysis warning:', err);
+  } catch {
     return null;
   }
 }
@@ -1309,12 +1240,29 @@ function saveGeminiCandidateCache(): void {
   }
 }
 
+function withSoftTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    promise
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+  });
+}
+
 /**
- * Fetches or retrieves the cached Gemini candidate highlight pool for a YouTube video.
+ * Fetches or retrieves the cached Gemini candidate highlight pool for a video,
+ * optionally grounded with real FFmpeg acoustic energy peaks and speech pause boundaries.
  */
 async function fetchGeminiRawCandidates(
   video: VideoRecord,
-  keepPercentage = DEFAULT_KEEP_PERCENTAGE
+  keepPercentage = DEFAULT_KEEP_PERCENTAGE,
+  mediaSignals?: SourceMediaSignals | null
 ): Promise<GeminiAnalysisSchema | null> {
   if (video.youtube_video_id && geminiCandidateCache[video.youtube_video_id]) {
     const cached = geminiCandidateCache[video.youtube_video_id];
@@ -1324,11 +1272,12 @@ async function fetchGeminiRawCandidates(
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!hasValidEnvKey(apiKey, 'MY_GEMINI_API_KEY') || !video.original_url.startsWith('http')) {
+  if (!hasValidEnvKey(apiKey, 'MY_GEMINI_API_KEY')) {
     return null;
   }
 
-  const inFlight = activeGeminiAnalyses.get(video.youtube_video_id);
+  const inFlightKey = `${video.youtube_video_id}:${mediaSignals ? 'telemetry' : 'raw'}`;
+  const inFlight = activeGeminiAnalyses.get(inFlightKey);
   if (inFlight) {
     return inFlight;
   }
@@ -1348,14 +1297,35 @@ async function fetchGeminiRawCandidates(
       const poolPct = Math.max(35, Math.min(55, validPct + 10));
       const target = calculateTargetDuration(video.duration, 0.04, validPct);
 
-      const prompt = `Analyze this YouTube video ("${video.title}" by ${video.channel}, exact total duration: ${video.duration} seconds).
+      const telemetrySummary =
+        mediaSignals && mediaSignals.energyPeaks.length > 0
+          ? `\nREAL FFMPEG ACOUSTIC & SPEECH-PAUSE TELEMETRY EXTRACTED FROM THE SOURCE FILE:\n` +
+            `- Natural Intro Speech Pause Boundary: ${mediaSignals.introEnd.toFixed(2)}s\n` +
+            `- Natural Outro Speech Pause Boundary: ${mediaSignals.outroStart.toFixed(2)}s\n` +
+            `- High-Energy Vocal/Action Windows (aligned to speech pauses):\n` +
+            mediaSignals.energyPeaks
+              .map(
+                (pk, idx) =>
+                  `  ${idx + 1}. ${pk.start_time.toFixed(2)}s to ${pk.end_time.toFixed(
+                    2
+                  )}s (peak at ${pk.peak_time.toFixed(2)}s, audio_score=${pk.audio_score.toFixed(
+                    2
+                  )}, dynamic_score=${pk.visual_score.toFixed(2)})`
+              )
+              .join('\n') +
+            `\nUse these exact unrounded acoustic windows and speech pause boundaries to anchor your highlight clips so every cut lands on a real speech boundary and captures the true high-energy moments.`
+          : '';
+
+      const prompt = `Analyze this video ("${video.title}" by ${video.channel}, exact total duration: ${video.duration} seconds).${
+        video.description ? `\nDescription context: ${video.description.slice(0, 400)}` : ''
+      }${telemetrySummary}
 Identify the strongest highlight segments so we can compile a highlight reel of approximately ${target.targetSeconds.toFixed(2)} seconds (around ${validPct}% of the original video length).
 
 CRITICAL CLIPPING & TIMING RULES:
 1. DO NOT keep fixed clip durations (never make every clip the same length like 20s or 30s). Each clip's length must naturally match the actual duration of that specific moment/scene.
 2. DO NOT round timestamps to whole integers or multiples of 5/10 seconds. Provide exact, unrounded decimal start_time and end_time in seconds (e.g., 14.38, 198.74) aligned to natural speech pauses and scene cuts.
 3. Always include the video's INTRO (starting at 0s) if an intro or opening hook exists, with role="intro".
-4. Select the ACTUAL BEST MOMENTS from the body of the video (the funniest, most intense, most informative, or highest-impact sequences), with role="highlight".
+4. Select the ACTUAL BEST MOMENTS from the body of the video (the funniest, most intense, most informative, or highest-impact sequences with both setup and payoff intact), with role="highlight".
 5. Always include the video's OUTRO (ending at ${video.duration}s) if a closing wrap-up, final reaction, or sign-off exists, with role="outro".
 
 Evaluate every candidate moment across four dimensions (0.0 to 1.0):
@@ -1428,12 +1398,11 @@ Return between 7 and 12 non-overlapping candidate segments spanning the video du
         required: ['video_summary', 'video_category', 'highlights'],
       };
 
-      const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-3.8-flash'];
-
-      for (const modelName of modelsToTry) {
-        try {
-          const response = await ai.models.generateContent({
-            model: modelName,
+      // Step 1: Attempt direct multimodal video analysis for short/medium YouTube videos when running before telemetry
+      if (!mediaSignals && video.original_url.startsWith('http') && video.duration <= 600) {
+        const multimodalResponse = await withSoftTimeout(
+          ai.models.generateContent({
+            model: 'gemini-3.8-flash',
             contents: [
               {
                 fileData: {
@@ -1447,17 +1416,51 @@ Return between 7 and 12 non-overlapping candidate segments spanning the video du
               responseMimeType: 'application/json',
               responseSchema,
               mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
-              ...(modelName === 'gemini-3.1-flash-lite'
-                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } }
-                : modelName === 'gemini-3.8-flash'
-                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-                : {}),
-               abortSignal: AbortSignal.timeout(18000),
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             },
-          });
+          }),
+          14000
+        );
 
-          const text = response.text;
-          if (text) {
+        const mmText = multimodalResponse?.text;
+        if (mmText) {
+          try {
+            const parsed = JSON.parse(mmText);
+            const validated = validateAndClampAICandidates(parsed, video.duration);
+            if (validated.highlights.length > 0) {
+              geminiCandidateCache[video.youtube_video_id] = validated;
+              saveGeminiCandidateCache();
+              return validated;
+            }
+          } catch {
+            // Fall through to telemetry-grounded Gemini analysis
+          }
+        }
+      }
+
+      // Step 2: Fast telemetry-grounded Gemini analysis (completes in ~1.5s without video ingestion timeouts)
+      for (const modelName of ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] as const) {
+        const fastResponse = await withSoftTimeout(
+          ai.models.generateContent({
+            model: modelName,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema,
+              thinkingConfig: {
+                thinkingLevel:
+                  modelName === 'gemini-3.1-flash-lite'
+                    ? ThinkingLevel.MINIMAL
+                    : ThinkingLevel.LOW,
+              },
+            },
+          }),
+          12000
+        );
+
+        const text = fastResponse?.text;
+        if (text) {
+          try {
             const parsed = JSON.parse(text);
             const validated = validateAndClampAICandidates(parsed, video.duration);
             if (validated.highlights.length > 0) {
@@ -1465,25 +1468,26 @@ Return between 7 and 12 non-overlapping candidate segments spanning the video du
               saveGeminiCandidateCache();
               return validated;
             }
+          } catch {
+            // Try next model
           }
-        } catch (err) {
-          console.warn(`Gemini model ${modelName} video analysis attempt warning:`, err);
         }
       }
+
       return null;
     } finally {
-      activeGeminiAnalyses.delete(video.youtube_video_id);
+      activeGeminiAnalyses.delete(inFlightKey);
     }
   })();
 
-  activeGeminiAnalyses.set(video.youtube_video_id, task);
+  activeGeminiAnalyses.set(inFlightKey, task);
   return task;
 }
 
 /**
- * Calls Google Gemini on the server to analyze a public YouTube URL
- * using a multi-model fallback chain (`gemini-3.1-flash-lite` -> `gemini-flash-latest` -> `gemini-3.8-flash`),
- * enriched with real FFmpeg audio/scene energy peaks when available.
+ * Calls Google Gemini on the server to analyze a video
+ * using a multi-model fallback chain (`gemini-3.8-flash` -> `gemini-3.1-flash-lite`),
+ * grounded and enriched with real FFmpeg audio/scene energy peaks and speech pauses.
  */
 async function analyzeVideoWithGemini(
   video: VideoRecord,
@@ -1505,9 +1509,9 @@ async function analyzeVideoWithGemini(
   }
 
   const rawSchema =
-    preFetchedRaw !== undefined
+    preFetchedRaw && preFetchedRaw.highlights.length > 0
       ? preFetchedRaw
-      : await fetchGeminiRawCandidates(video, validPct);
+      : await fetchGeminiRawCandidates(video, validPct, mediaSignals);
 
   if (rawSchema && rawSchema.highlights.length > 0) {
     const clamped = validateAndClampAICandidates(rawSchema, video.duration);
@@ -1535,7 +1539,10 @@ async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string |
 
   const cachedPath = path.join(UPLOADS_DIR, `yt-${youtubeVideoId}.mp4`);
   if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 50000) {
-    return cachedPath;
+    const cachedHeight = await probeVideoStreamHeight(cachedPath);
+    if (cachedHeight >= 720) {
+      return cachedPath;
+    }
   }
 
   const existing = activeYouTubeDownloads.get(youtubeVideoId);
@@ -1545,118 +1552,108 @@ async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string |
 
   const downloadPromise = (async (): Promise<string | null> => {
     const ytUrl = `https://www.youtube.com/watch?v=${youtubeVideoId}`;
-    const mirrors = ['https://s64.notube.net', 'https://s61.notube.net', 'https://s59.notube.net'];
+    const formatsToTry: ('mp4hd' | 'mp4')[] = ['mp4hd', 'mp4'];
 
-    // Race all mirrors in parallel to pick the fastest responding server first
-    let orderedMirrors = mirrors;
-    const preFetchedWeights = new Map<string, { token?: string; name_mp4?: string }>();
-    try {
-      const fastest = await Promise.any(
-        mirrors.map(async (mirror) => {
-          const weightRes = await fetch(`${mirror}/recover_weight.php`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'User-Agent': 'Mozilla/5.0',
-            },
-            body: `url=${encodeURIComponent(ytUrl)}&format=mp4&lang=en`,
-            signal: AbortSignal.timeout(10000),
-          });
-          if (!weightRes.ok) throw new Error('Mirror weight failed');
-          const weightData = (await weightRes.json()) as {
-            token?: string;
-            name_mp4?: string;
-          };
-          if (!weightData.token) throw new Error('Missing token');
-          preFetchedWeights.set(mirror, weightData);
-          return { mirror, weightData };
-        })
+    const resolveDownloadUrlFromMirror = async (
+      mirror: string,
+      fmt: 'mp4hd' | 'mp4'
+    ): Promise<string> => {
+      const weightRes = await fetch(`${mirror}/recover_weight.php`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0',
+        },
+        body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&lang=en&subscribed=false`,
+        signal: AbortSignal.timeout(9000),
+      });
+      if (!weightRes.ok) throw new Error(`weight failed on ${mirror}`);
+      const weightData = (await weightRes.json()) as {
+        token?: string;
+        name_mp4?: string;
+      };
+      if (!weightData.token) throw new Error(`missing token on ${mirror}`);
+
+      const recoverRes = await fetch(`${mirror}/recover_file.php`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0',
+        },
+        body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&name_mp4=${encodeURIComponent(
+          weightData.name_mp4 || ''
+        )}&lang=en&token=${encodeURIComponent(
+          weightData.token
+        )}&subscribed=true&playlist=false&adblock=false`,
+        signal: AbortSignal.timeout(35000),
+      });
+      if (!recoverRes.ok) throw new Error(`recover_file failed on ${mirror}`);
+      const recoverText = await recoverRes.text();
+      if (recoverText.includes('cf-turnstile') || !recoverText.includes(weightData.token)) {
+        throw new Error(`turnstile or invalid token on ${mirror}`);
+      }
+
+      const dlPageRes = await fetch(
+        `https://notube.net/en/download?token=${encodeURIComponent(weightData.token)}`,
+        {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(10000),
+        }
       );
-      orderedMirrors = [
-        fastest.mirror,
-        ...mirrors.filter((m) => m !== fastest.mirror),
-      ];
-    } catch {
-      // Fall back to default mirror order
-    }
+      if (!dlPageRes.ok) throw new Error(`download page failed on ${mirror}`);
 
-    for (const mirror of orderedMirrors) {
-      const tmpPath = path.join(UPLOADS_DIR, `yt-${youtubeVideoId}-${Date.now()}.tmp.mp4`);
-      try {
-        let weightData = preFetchedWeights.get(mirror);
-        if (!weightData) {
-          const weightRes = await fetch(`${mirror}/recover_weight.php`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'User-Agent': 'Mozilla/5.0',
-            },
-            body: `url=${encodeURIComponent(ytUrl)}&format=mp4&lang=en`,
-            signal: AbortSignal.timeout(12000),
-          });
-          if (!weightRes.ok) continue;
-          weightData = (await weightRes.json()) as {
-            token?: string;
-            name_mp4?: string;
-          };
-        }
-        if (!weightData.token) continue;
+      const dlHtml = await dlPageRes.text();
+      const dlMatch = dlHtml.match(
+        /https?:\/\/s\d+\.notube\.net\/download\.php\?token=[^"'\s>]+/i
+      );
+      if (!dlMatch || !dlMatch[0]) throw new Error(`no download url on ${mirror}`);
 
-        const recoverRes = await fetch(`${mirror}/recover_file.php?lang=en`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'Mozilla/5.0',
-          },
-          body: `url=${encodeURIComponent(ytUrl)}&format=mp4&name_mp4=${encodeURIComponent(
-            weightData.name_mp4 || ''
-          )}&token=${encodeURIComponent(weightData.token)}`,
-          signal: AbortSignal.timeout(40000),
-        });
-        if (!recoverRes.ok) continue;
+      const downloadUrl = dlMatch[0].replace(/&amp;/g, '&');
+      if (/key=$/i.test(downloadUrl)) throw new Error(`empty key on ${mirror}`);
+      return downloadUrl;
+    };
 
-        const dlPageRes = await fetch(
-          `https://notube.net/en/download?token=${encodeURIComponent(weightData.token)}`,
-          {
-            headers: { 'User-Agent': 'Mozilla/5.0' },
-            signal: AbortSignal.timeout(12000),
-          }
+    for (const fmt of formatsToTry) {
+      const mirrors = pickNotubeMirrors(6);
+      const batches = [mirrors.slice(0, 3), mirrors.slice(3, 6)];
+      for (const batch of batches) {
+        const tmpPath = path.join(
+          UPLOADS_DIR,
+          `yt-${youtubeVideoId}-${fmt}-${Date.now()}.tmp.mp4`
         );
-        if (!dlPageRes.ok) continue;
-
-        const dlHtml = await dlPageRes.text();
-        const dlMatch = dlHtml.match(
-          /https?:\/\/s\d+\.notube\.net\/download\.php\?token=[^"'\s>]+/i
-        );
-        if (!dlMatch || !dlMatch[0]) continue;
-
-        const downloadUrl = dlMatch[0].replace(/&amp;/g, '&');
-        await execFileAsync(
-          'curl',
-          ['-sL', '--max-time', '80', '-A', 'Mozilla/5.0', '-o', tmpPath, downloadUrl],
-          { timeout: 85000 }
-        );
-
-        if (fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 50000) {
-          const dur = await probeVideoDuration(tmpPath);
-          if (dur >= 5) {
-            fs.renameSync(tmpPath, cachedPath);
-            // Pre-warm audio signals in the background immediately upon download completion
-            void extractRawAudioSignals(cachedPath);
-            return cachedPath;
-          }
-        }
-      } catch (err) {
-        console.warn(`YouTube MP4 download attempt via ${mirror} warning:`, err);
-      } finally {
         try {
-          if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+          const downloadUrl = await Promise.any(
+            batch.map((m) => resolveDownloadUrlFromMirror(m, fmt))
+          );
+          await execFileAsync(
+            'curl',
+            ['-sL', '--max-time', '90', '-A', 'Mozilla/5.0', '-o', tmpPath, downloadUrl],
+            { timeout: 95000 }
+          );
+
+          if (fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 50000) {
+            const dur = await probeVideoDuration(tmpPath);
+            if (dur >= 5) {
+              fs.renameSync(tmpPath, cachedPath);
+              void extractRawAudioSignals(cachedPath);
+              return cachedPath;
+            }
+          }
         } catch {
-          // ignore
+          // Try next batch or format
+        } finally {
+          try {
+            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+          } catch {
+            // ignore
+          }
         }
       }
     }
 
+    if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 50000) {
+      return cachedPath;
+    }
     return null;
   })();
 
@@ -1668,11 +1665,14 @@ async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string |
   }
 }
 
-const renderSignatureCache = new Map<string, { outputPath: string; actualDuration: number }>();
+const renderSignatureCache = new Map<
+  string,
+  { outputPath: string; actualDuration: number; width: number; height: number }
+>();
 
 /**
  * Renders the selected highlight segments from a local source media file
- * into a single chronological 720p HD H.264 + AAC MP4 file using FFmpeg without rounding timestamps.
+ * into a single chronological 1080p Full HD or 720p HD H.264 (High Profile, CRF 17) + 192kbps AAC MP4 file.
  */
 async function renderHighlightReelWithFfmpeg(
   job: HighlightJobRecord,
@@ -1692,7 +1692,6 @@ async function renderHighlightReelWithFfmpeg(
   const durationRatio =
     video.duration > 0 ? sourceDuration / Math.max(1, video.duration) : 1;
 
-  // Keep video.duration exact (unrounded) when a real non-fixture source file is present
   const jobKeepPct = clampKeepPercentage(job.keep_percentage);
   if (!video.is_fixture && sourceDuration >= 5) {
     if (Math.abs(sourceDuration - video.duration) > 10) {
@@ -1720,60 +1719,28 @@ async function renderHighlightReelWithFfmpeg(
     ordered.reduce((acc, seg) => acc + Math.max(0.5, seg.end_time - seg.start_time), 0)
   );
 
+  const resSpec = selectTargetOutputResolution(sourceInfo.width, sourceInfo.height);
   const finalFilename = `highlight-${video.youtube_video_id}-${job.id}.mp4`;
   const finalOutputPath = path.join(RENDERS_DIR, finalFilename);
 
-  // Check if an identical 720p HD render already exists for this exact clip signature
   const signature = computeClipRenderSignature(video.id, jobKeepPct, ordered);
   const cachedRender = renderSignatureCache.get(signature);
   if (
     cachedRender &&
     fs.existsSync(cachedRender.outputPath) &&
-    (await probeVideoStreamHeight(cachedRender.outputPath)) >= 720
+    (await probeVideoStreamHeight(cachedRender.outputPath)) >= resSpec.height
   ) {
     if (cachedRender.outputPath !== finalOutputPath) {
       fs.copyFileSync(cachedRender.outputPath, finalOutputPath);
     }
+    job.output_resolution_width = cachedRender.width;
+    job.output_resolution_height = cachedRender.height;
     return { outputPath: finalOutputPath, actualDuration: cachedRender.actualDuration };
   }
 
-  for (const otherJob of Object.values(db.jobs)) {
-    if (
-      otherJob.id !== job.id &&
-      otherJob.video_id === video.id &&
-      otherJob.status === 'complete' &&
-      otherJob.download_location &&
-      fs.existsSync(otherJob.download_location)
-    ) {
-      const otherSegs = [...(db.segments[otherJob.id] || [])].sort(
-        (a, b) => a.sequence_order - b.sequence_order
-      );
-      const otherSig = computeClipRenderSignature(
-        video.id,
-        clampKeepPercentage(otherJob.keep_percentage),
-        otherSegs
-      );
-      if (otherSig === signature && (await probeVideoStreamHeight(otherJob.download_location)) >= 720) {
-        if (otherJob.download_location !== finalOutputPath) {
-          fs.copyFileSync(otherJob.download_location, finalOutputPath);
-        }
-        const reusedDuration = otherJob.actual_output_duration || totalPlannedDuration;
-        renderSignatureCache.set(signature, {
-          outputPath: finalOutputPath,
-          actualDuration: reusedDuration,
-        });
-        return { outputPath: finalOutputPath, actualDuration: reusedDuration };
-      }
-    }
-  }
-
-  // High-definition 720p 30fps encoding with single-stage post-concat scaling + multi-threaded libx264
-  const audioKbps = 128;
-  const maxVideoKbps = Math.max(
-    500,
-    Math.min(2500, Math.floor(200000 / totalPlannedDuration) - audioKbps)
-  );
-  const crfValue = totalPlannedDuration > 450 ? '21' : '19';
+  const audioKbps = 192;
+  const maxVideoKbps = resSpec.targetMaxBitrateKbps;
+  const crfValue = '16';
 
   const ffmpegArgs: string[] = ['-y'];
   const filterParts: string[] = [];
@@ -1804,21 +1771,28 @@ async function renderHighlightReelWithFfmpeg(
     );
 
     if (inputHasAudio) {
+      const fadeDur = 0.055;
+      const fadeOutStart = Math.max(0, safeDuration - fadeDur);
+      const fadeInFilter = safeStart > 0.05 ? `,afade=t=in:st=0:d=${fadeDur}` : '';
+      const fadeOutFilter =
+        safeDuration > 0.25 ? `,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur}` : '';
       filterParts.push(
-        `[${i}:a:0]aresample=44100:async=1,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`
+        `[${i}:a:0]aresample=48000:async=1,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo${fadeInFilter}${fadeOutFilter}[a${i}]`
       );
     } else {
       filterParts.push(
-        `anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:${safeDuration.toFixed(3)}[a${i}]`
+        `anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${safeDuration.toFixed(3)}[a${i}]`
       );
     }
     concatInputs.push(`[${i}:v:0][a${i}]`);
   }
 
+  const needsUpscaleSharpen = sourceInfo.height > 0 && sourceInfo.height < resSpec.height;
+  const sharpenChain = needsUpscaleSharpen ? ',unsharp=5:5:0.55:3:3:0.0' : '';
   const postConcatVideoFilter =
-    sourceInfo.width === 1280 && sourceInfo.height === 720
-      ? '[catv]setsar=1,fps=30[outv]'
-      : '[catv]scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1,fps=30[outv]';
+    sourceInfo.width === resSpec.width && sourceInfo.height === resSpec.height
+      ? '[catv]setsar=1[outv]'
+      : `[catv]scale=${resSpec.width}:${resSpec.height}:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int${sharpenChain},pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1[outv]`;
 
   filterParts.push(
     `${concatInputs.join('')}concat=n=${ordered.length}:v=1:a=1[catv][outa];${postConcatVideoFilter}`
@@ -1840,7 +1814,11 @@ async function renderHighlightReelWithFfmpeg(
     '-c:v',
     'libx264',
     '-preset',
-    'ultrafast',
+    'veryfast',
+    '-profile:v',
+    'high',
+    '-level',
+    '4.1',
     '-crf',
     crfValue,
     '-maxrate',
@@ -1852,7 +1830,7 @@ async function renderHighlightReelWithFfmpeg(
     '-c:a',
     'aac',
     '-ar',
-    '44100',
+    '48000',
     '-ac',
     '2',
     '-b:a',
@@ -1865,12 +1843,20 @@ async function renderHighlightReelWithFfmpeg(
   try {
     await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 180000 });
     fs.renameSync(tmpOutputPath, finalOutputPath);
-    const probedDuration = await probeVideoDuration(finalOutputPath);
+    const renderedInfo = await probeMediaInfo(finalOutputPath);
+    const probedDuration = renderedInfo.duration;
     const actualDuration =
       Math.abs(probedDuration - totalPlannedDuration) < 0.8
         ? totalPlannedDuration
         : probedDuration;
-    renderSignatureCache.set(signature, { outputPath: finalOutputPath, actualDuration });
+    job.output_resolution_width = renderedInfo.width || resSpec.width;
+    job.output_resolution_height = renderedInfo.height || resSpec.height;
+    renderSignatureCache.set(signature, {
+      outputPath: finalOutputPath,
+      actualDuration,
+      width: job.output_resolution_width,
+      height: job.output_resolution_height,
+    });
     return { outputPath: finalOutputPath, actualDuration };
   } finally {
     try {
@@ -1973,9 +1959,10 @@ async function runHighlightPipeline(jobId: string, channelAccessToken?: string):
       'Identifying intro, actual best moments, and outro across the video...'
     );
 
-    const geminiRawTask = fixture
-      ? Promise.resolve(null)
-      : fetchGeminiRawCandidates(video, activeKeepPct);
+    const geminiRawTask =
+      fixture || !video.original_url.startsWith('http') || video.duration > 600
+        ? Promise.resolve(null)
+        : fetchGeminiRawCandidates(video, activeKeepPct);
 
     const engagementTask = fetchEngagementData(video.youtube_video_id, channelAccessToken);
 
@@ -2090,12 +2077,27 @@ async function runHighlightPipeline(jobId: string, channelAccessToken?: string):
         segmentRecords
       );
 
+      // If this was a private local video uploaded from the user's computer, remove the raw upload after rendering
+      if (
+        video.id.startsWith('vid-upload-') &&
+        job.source_media_path &&
+        job.source_media_path.startsWith(UPLOADS_DIR) &&
+        fs.existsSync(job.source_media_path)
+      ) {
+        try {
+          fs.unlinkSync(job.source_media_path);
+          job.source_media_path = undefined;
+        } catch {
+          // ignore cleanup error
+        }
+      }
+
       updateJobStage(
         jobId,
         'complete',
         8,
         100,
-        'Highlight video compiled and ready to watch.',
+        'Highlight video compiled in HD and ready to watch.',
         {
           source_media_status: 'rendered',
           download_location: outputPath,
@@ -2184,257 +2186,21 @@ async function extractVideoFrameDataUri(filePath: string): Promise<string> {
 }
 
 async function backfillMissingCompiledVideos(): Promise<void> {
-  // Remove stale non-fixture videos that had fallback 300s duration and are not referenced by any job
-  const referencedVideoIds = new Set(Object.values(db.jobs).map((j) => j.video_id));
-  for (const [vidId, vid] of Object.entries(db.videos)) {
-    if (!vid.is_fixture && vid.duration === 300 && !referencedVideoIds.has(vidId)) {
-      delete db.videos[vidId];
+  // Remove any unowned jobs so another user's videos are never retained globally
+  let modified = false;
+  for (const [id, job] of Object.entries(db.jobs)) {
+    if (!sanitizeClientId(job.owner_client_id)) {
+      delete db.jobs[id];
+      delete db.segments[id];
+      modified = true;
+      continue;
     }
-  }
-
-  // Resume any interrupted in-progress jobs
-  for (const job of Object.values(db.jobs)) {
     if (job.status !== 'complete' && job.status !== 'failed') {
       void runHighlightPipeline(job.id);
     }
   }
-
-  // Remove older duplicate completed jobs for the same video_id or identical uploaded video title+duration
-  const jobsByCreatedDesc = Object.values(db.jobs).sort(
-    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-  );
-  const seenVideoKeys = new Set<string>();
-  let removedDuplicates = false;
-  for (const j of jobsByCreatedDesc) {
-    const vid = db.videos[j.video_id];
-    const dedupKey = vid
-      ? `${vid.title.trim().toLowerCase()}::${Math.round(vid.duration)}`
-      : j.video_id;
-    if (seenVideoKeys.has(j.video_id) || seenVideoKeys.has(dedupKey) || j.video_id === 'vid-chvzvot4X1A') {
-      delete db.jobs[j.id];
-      delete db.segments[j.id];
-      removedDuplicates = true;
-    } else {
-      seenVideoKeys.add(j.video_id);
-      seenVideoKeys.add(dedupKey);
-    }
-  }
-  if (removedDuplicates) {
+  if (modified) {
     saveDb();
-  }
-
-  for (const job of Object.values(db.jobs)) {
-    if (job.status !== 'complete') continue;
-    const video = db.videos[job.video_id];
-    let segments = db.segments[job.id] || [];
-    if (!video || segments.length === 0) continue;
-
-    // Ensure every segment has an explicit role classification
-    let rolesUpdated = false;
-    const jobKeepPct = clampKeepPercentage(job.keep_percentage);
-    if (job.keep_percentage !== jobKeepPct) {
-      job.keep_percentage = jobKeepPct;
-      rolesUpdated = true;
-    }
-
-    if (
-      !video.is_fixture &&
-      video.id.startsWith('vid-upload-') &&
-      video.thumbnail === KEYNOTE_THUMBNAIL_SVG &&
-      job.source_media_path &&
-      fs.existsSync(job.source_media_path)
-    ) {
-      const realThumb = await extractVideoFrameDataUri(job.source_media_path);
-      if (realThumb) {
-        video.thumbnail = realThumb;
-        rolesUpdated = true;
-      }
-    }
-    for (const seg of segments) {
-      const inferred = classifySegmentRole(seg, video.duration);
-      if (seg.role !== inferred) {
-        seg.role = inferred;
-        rolesUpdated = true;
-      }
-    }
-
-    const exactSegmentSum = segments.reduce((acc, s) => acc + (s.end_time - s.start_time), 0);
-    if (
-      exactSegmentSum > 0 &&
-      Math.abs((job.actual_output_duration || 0) - exactSegmentSum) > 0.001 &&
-      Math.abs((job.actual_output_duration || 0) - exactSegmentSum) < 1.0
-    ) {
-      job.actual_output_duration = exactSegmentSum;
-      rolesUpdated = true;
-    }
-
-    const lacksIntroOrOutro =
-      video.duration >= 20 &&
-      (segments[0]?.role !== 'intro' || segments[segments.length - 1]?.role !== 'outro');
-
-    // Detect legacy jobs with rounded integer durations, duplicate titles, or fixed repeated clip blocks
-    const clipDurations = segments.map((s) => Math.round((s.end_time - s.start_time) * 100) / 100);
-    const clipTitles = segments.map((s) => s.title);
-    const hasDuplicateTitles = new Set(clipTitles).size < clipTitles.length;
-    const hasDuplicateFixedBlocks =
-      new Set(clipDurations).size < clipDurations.length ||
-      clipDurations.includes(36) ||
-      clipDurations.includes(45);
-    const hasRoundedSegmentTimes = segments.every(
-      (s) => Number.isInteger(s.start_time) && Number.isInteger(s.end_time)
-    );
-    const hasRoundedVideoDuration =
-      !video.is_fixture && Number.isInteger(video.duration);
-    const expectedReelSeconds = video.duration * (jobKeepPct / 100);
-    const deviatesFromKeepPercent =
-      Math.abs((job.actual_output_duration || 0) - expectedReelSeconds) > 1.2;
-
-    const needsTimingRefinement =
-      lacksIntroOrOutro ||
-      hasDuplicateTitles ||
-      hasDuplicateFixedBlocks ||
-      hasRoundedSegmentTimes ||
-      hasRoundedVideoDuration ||
-      deviatesFromKeepPercent;
-
-    const lacksRealSource = !job.source_media_path || !fs.existsSync(job.source_media_path);
-    let isLowResolutionRender = false;
-    if (job.download_location && fs.existsSync(job.download_location)) {
-      const renderHeight = await probeVideoStreamHeight(job.download_location);
-      if (renderHeight > 0 && renderHeight < 720) {
-        isLowResolutionRender = true;
-      }
-    }
-    const lacksRenderedOutput =
-      job.source_media_status !== 'rendered' ||
-      !job.download_location ||
-      !fs.existsSync(job.download_location) ||
-      fs.statSync(job.download_location).size > 29 * 1024 * 1024 ||
-      isLowResolutionRender;
-
-    if (lacksRealSource || lacksRenderedOutput || needsTimingRefinement) {
-      try {
-        if (lacksRealSource) {
-          if (video.is_fixture) {
-            job.source_media_path = await ensureFixtureSourceVideo();
-            job.source_media_duration = video.duration;
-            job.rights_confirmed = true;
-          } else if (video.youtube_video_id) {
-            const downloaded = await downloadYouTubeVideoMp4(video.youtube_video_id);
-            if (downloaded && fs.existsSync(downloaded)) {
-              job.source_media_path = downloaded;
-              job.source_media_duration = await probeVideoDuration(downloaded);
-              job.rights_confirmed = true;
-            } else {
-              job.source_media_status = 'missing_source';
-              job.download_location = undefined;
-              saveDb();
-              continue;
-            }
-          }
-        }
-
-        if (!video.is_fixture && job.source_media_path && fs.existsSync(job.source_media_path)) {
-          const exactDur = await probeVideoDuration(job.source_media_path);
-          if (exactDur >= 5) {
-            video.duration = exactDur;
-            job.source_media_duration = exactDur;
-            job.target_duration = calculateTargetDuration(
-              exactDur,
-              0.04,
-              jobKeepPct
-            ).targetSeconds;
-          }
-        }
-
-        if (needsTimingRefinement && !video.is_fixture) {
-          const mediaSignals = await analyzeSourceMediaSignals(
-            job.source_media_path,
-            video.duration,
-            jobKeepPct
-          );
-          const seenExistingTitles = new Set<string>();
-          const realExistingSegments = segments
-            .filter((s) => {
-              if (s.title.startsWith('Best Moment —')) return false;
-              if (seenExistingTitles.has(s.title)) return false;
-              seenExistingTitles.add(s.title);
-              return true;
-            })
-            .map((s, idx) => {
-              const len = s.end_time - s.start_time;
-              const isLegacyFixedBlock =
-                Math.abs(len - 36) < 0.25 || Math.abs(len - 45) < 0.25;
-              const naturalFactor = idx === 0 ? 0.023 : 0.031 + ((idx * 17) % 19) * 0.0014;
-              const restoredEnd = isLegacyFixedBlock
-                ? s.start_time + video.duration * naturalFactor
-                : s.end_time;
-              return {
-                ...s,
-                end_time: Math.min(video.duration, restoredEnd),
-              };
-            });
-
-          const aligned = alignAndEnrichCandidatesWithMediaSignals(
-            {
-              video_summary: job.video_summary || video.description,
-              video_category: job.video_category || 'Video',
-              highlights: realExistingSegments,
-            },
-            video.duration,
-            mediaSignals,
-            jobKeepPct
-          );
-
-          const coveredPool = ensureCandidateCoverageForTarget(
-            aligned.highlights,
-            video.duration,
-            jobKeepPct
-          );
-          const scored = scoreAndMergeCandidates(coveredPool, [], {
-            engagementAvailable: false,
-            audioAvailable: true,
-            videoDuration: video.duration,
-          });
-          const reselected = selectHighlightReel(
-            scored,
-            video.duration,
-            {
-              pauseBoundaries: mediaSignals?.pauseBoundaries || [],
-            },
-            jobKeepPct
-          );
-          if (reselected.length > 0) {
-            segments = reselected.map((seg, idx) => ({
-              id: `seg-${job.id}-${idx + 1}`,
-              job_id: job.id,
-              ...seg,
-              role: seg.role || classifySegmentRole(seg, video.duration),
-            }));
-            db.segments[job.id] = segments;
-            rolesUpdated = true;
-          }
-        }
-
-        if (job.source_media_path && fs.existsSync(job.source_media_path)) {
-          const { outputPath, actualDuration } = await renderHighlightReelWithFfmpeg(
-            job,
-            video,
-            segments
-          );
-          job.source_media_status = 'rendered';
-          job.download_location = outputPath;
-          job.actual_output_duration = actualDuration;
-          saveDb();
-        } else if (rolesUpdated) {
-          saveDb();
-        }
-      } catch (err) {
-        console.warn(`Failed to backfill compiled MP4 for job ${job.id}:`, err);
-      }
-    } else if (rolesUpdated) {
-      saveDb();
-    }
   }
 }
 
@@ -2442,12 +2208,8 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
-  ensureFixtureSourceVideo().catch((err) =>
-    console.warn('Background fixture video generation warning:', err)
-  );
-  backfillMissingCompiledVideos().catch((err) =>
-    console.warn('Background backfill compilation warning:', err)
-  );
+  ensureFixtureSourceVideo().catch(() => {});
+  backfillMissingCompiledVideos().catch(() => {});
 
   app.get('/api/system/status', (_req, res) => {
     const geminiConfigured = hasValidEnvKey(process.env.GEMINI_API_KEY, 'MY_GEMINI_API_KEY');
@@ -2506,6 +2268,7 @@ async function startServer() {
       const video = await inspectYouTubeVideo(url, durationSeconds);
       const target = calculateTargetDuration(video.duration, 0.04, keepPct);
       const fixture = DEVELOPMENT_FIXTURES[video.youtube_video_id];
+      const ownerClientId = extractRequestClientId(req);
 
       const jobId = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
       const job: HighlightJobRecord = {
@@ -2522,6 +2285,7 @@ async function startServer() {
         keep_percentage: keepPct,
         target_duration: target.targetSeconds,
         actual_output_duration: 0,
+        owner_client_id: ownerClientId || undefined,
         created_at: new Date().toISOString(),
       };
 
@@ -2558,6 +2322,7 @@ async function startServer() {
         const keepPct = clampKeepPercentage(
           req.body?.keepPercentage !== undefined ? Number(req.body.keepPercentage) : undefined
         );
+        const ownerClientId = extractRequestClientId(req);
 
         let video: VideoRecord;
         if (rawUrl && extractYouTubeVideoId(rawUrl)) {
@@ -2602,6 +2367,7 @@ async function startServer() {
           keep_percentage: keepPct,
           target_duration: target.targetSeconds,
           actual_output_duration: 0,
+          owner_client_id: ownerClientId || undefined,
           created_at: new Date().toISOString(),
         };
 
@@ -2655,9 +2421,52 @@ async function startServer() {
     });
   });
 
-  app.get('/api/highlights', (_req, res) => {
+  app.delete('/api/highlights/:job_id', (req, res) => {
+    const job = db.jobs[req.params.job_id];
+    if (!job) {
+      res.status(404).json({ error: 'Highlight job not found.' });
+      return;
+    }
+    const clientId = extractRequestClientId(req);
+    if (job.owner_client_id && clientId && job.owner_client_id !== clientId) {
+      res.status(403).json({ error: 'You can only delete your own compiled videos.' });
+      return;
+    }
+    if (job.download_location && fs.existsSync(job.download_location)) {
+      try {
+        fs.unlinkSync(job.download_location);
+      } catch {
+        // ignore
+      }
+    }
+    if (
+      job.source_media_path &&
+      job.source_media_path.startsWith(UPLOADS_DIR) &&
+      job.source_media_path.includes('upload-') &&
+      fs.existsSync(job.source_media_path)
+    ) {
+      try {
+        fs.unlinkSync(job.source_media_path);
+      } catch {
+        // ignore
+      }
+    }
+    delete db.jobs[job.id];
+    delete db.segments[job.id];
+    saveDb();
+    res.json({ deleted: true, id: req.params.job_id });
+  });
+
+  app.get('/api/highlights', (req, res) => {
+    const clientId = extractRequestClientId(req);
+    res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate');
     const jobsList = Object.values(db.jobs)
-      .filter((j) => j.status === 'complete' && (db.segments[j.id] || []).length > 0)
+      .filter(
+        (j) =>
+          j.status === 'complete' &&
+          (db.segments[j.id] || []).length > 0 &&
+          isJobVisibleToClient(j, clientId)
+      )
       .sort((a, b) => b.created_at.localeCompare(a.created_at))
       .slice(0, 50)
       .map((job) => {
@@ -2723,8 +2532,8 @@ async function startServer() {
           job.actual_output_duration = actualDuration;
           saveDb();
         }
-      } catch (err) {
-        console.warn(`On-demand render warning for job ${job.id}:`, err);
+      } catch {
+        // Ignore transient on-demand render warning
       }
     }
 
@@ -2965,8 +2774,8 @@ async function startServer() {
           job.actual_output_duration = actualDuration;
           saveDb();
         }
-      } catch (err) {
-        console.warn(`On-demand download render warning for job ${job.id}:`, err);
+      } catch {
+        // Ignore transient on-demand download render warning
       }
     }
 
@@ -2989,14 +2798,26 @@ async function startServer() {
       `highlight-${videoIdSlug}.mp4`;
     const encodedUtf8Filename = encodeURIComponent(downloadFilename);
 
+    const clientId = extractRequestClientId(req);
+    if (
+      req.query.download === '1' &&
+      job.owner_client_id &&
+      clientId &&
+      job.owner_client_id !== clientId
+    ) {
+      res.status(403).json({
+        error: 'Only the creator of this video can save the MP4 file to their local computer.',
+      });
+      return;
+    }
+
     const stat = fs.statSync(job.download_location);
     const fileSize = stat.size;
     const range = req.headers.range;
 
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${asciiSafeFilename}"; filename*=UTF-8''${encodedUtf8Filename}`
-    );
+    res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Type', 'video/mp4');
 
@@ -3005,6 +2826,8 @@ async function startServer() {
         'Content-Disposition',
         `attachment; filename="${asciiSafeFilename}"; filename*=UTF-8''${encodedUtf8Filename}`
       );
+    } else {
+      res.setHeader('Content-Disposition', 'inline');
     }
 
     if (range && req.query.download !== '1') {
@@ -3032,8 +2855,13 @@ async function startServer() {
   });
 
   if (process.env.NODE_ENV !== 'production') {
+    process.env.DISABLE_HMR = 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+        watch: null,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -3045,7 +2873,7 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Highlight server listening on http://0.0.0.0:${PORT}`);
   });
