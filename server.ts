@@ -1532,7 +1532,10 @@ async function analyzeVideoWithGemini(
  */
 const activeYouTubeDownloads = new Map<string, Promise<string | null>>();
 
-async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string | null> {
+async function downloadYouTubeVideoMp4(
+  youtubeVideoId: string,
+  onProgress?: (pct: number, msg: string) => void
+): Promise<string | null> {
   if (!youtubeVideoId || DEVELOPMENT_FIXTURES[youtubeVideoId]) {
     return null;
   }
@@ -1541,12 +1544,14 @@ async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string |
   if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 50000) {
     const cachedHeight = await probeVideoStreamHeight(cachedPath);
     if (cachedHeight >= 720) {
+      onProgress?.(48, 'Loaded cached HD source video stream...');
       return cachedPath;
     }
   }
 
   const existing = activeYouTubeDownloads.get(youtubeVideoId);
   if (existing) {
+    onProgress?.(28, 'Fetching HD source video stream...');
     return existing;
   }
 
@@ -1554,49 +1559,83 @@ async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string |
     const ytUrl = `https://www.youtube.com/watch?v=${youtubeVideoId}`;
     const formatsToTry: ('mp4hd' | 'mp4')[] = ['mp4hd', 'mp4'];
 
-    const resolveDownloadUrlFromMirror = async (
+    const findFastestWeightMirror = async (
+      mirrors: string[],
+      fmt: 'mp4hd' | 'mp4'
+    ): Promise<{ mirror: string; token: string; nameMp4: string }> => {
+      const controllers = mirrors.map(() => new AbortController());
+      const timer = setTimeout(() => {
+        for (const c of controllers) c.abort();
+      }, 9500);
+
+      try {
+        const winner = await Promise.any(
+          mirrors.map(async (mirror, idx) => {
+            const weightRes = await fetch(`${mirror}/recover_weight.php`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0',
+                Origin: 'https://notube.net',
+                Referer: 'https://notube.net/',
+              },
+              body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&lang=en&subscribed=false`,
+              signal: controllers[idx].signal,
+            });
+            if (!weightRes.ok) throw new Error(`weight failed on ${mirror}`);
+            const weightData = (await weightRes.json()) as {
+              token?: string;
+              name_mp4?: string;
+            };
+            if (!weightData.token) throw new Error(`missing token on ${mirror}`);
+            return {
+              mirror,
+              token: weightData.token,
+              nameMp4: weightData.name_mp4 || '',
+            };
+          })
+        );
+        for (const c of controllers) c.abort();
+        return winner;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const recoverAndResolveUrl = async (
       mirror: string,
+      token: string,
+      nameMp4: string,
       fmt: 'mp4hd' | 'mp4'
     ): Promise<string> => {
-      const weightRes = await fetch(`${mirror}/recover_weight.php`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'Mozilla/5.0',
-        },
-        body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&lang=en&subscribed=false`,
-        signal: AbortSignal.timeout(9000),
-      });
-      if (!weightRes.ok) throw new Error(`weight failed on ${mirror}`);
-      const weightData = (await weightRes.json()) as {
-        token?: string;
-        name_mp4?: string;
-      };
-      if (!weightData.token) throw new Error(`missing token on ${mirror}`);
-
       const recoverRes = await fetch(`${mirror}/recover_file.php`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
           'User-Agent': 'Mozilla/5.0',
+          Origin: 'https://notube.net',
+          Referer: 'https://notube.net/',
         },
         body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&name_mp4=${encodeURIComponent(
-          weightData.name_mp4 || ''
+          nameMp4
         )}&lang=en&token=${encodeURIComponent(
-          weightData.token
+          token
         )}&subscribed=true&playlist=false&adblock=false`,
-        signal: AbortSignal.timeout(35000),
+        signal: AbortSignal.timeout(40000),
       });
       if (!recoverRes.ok) throw new Error(`recover_file failed on ${mirror}`);
       const recoverText = await recoverRes.text();
-      if (recoverText.includes('cf-turnstile') || !recoverText.includes(weightData.token)) {
+      if (recoverText.includes('cf-turnstile') || !recoverText.includes(token)) {
         throw new Error(`turnstile or invalid token on ${mirror}`);
       }
 
       const dlPageRes = await fetch(
-        `https://notube.net/en/download?token=${encodeURIComponent(weightData.token)}`,
+        `https://notube.net/en/download?token=${encodeURIComponent(token)}`,
         {
-          headers: { 'User-Agent': 'Mozilla/5.0' },
+          headers: {
+            'User-Agent': 'Mozilla/5.0',
+            Referer: 'https://notube.net/',
+          },
           signal: AbortSignal.timeout(10000),
         }
       );
@@ -1614,17 +1653,25 @@ async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string |
     };
 
     for (const fmt of formatsToTry) {
-      const mirrors = pickNotubeMirrors(6);
-      const batches = [mirrors.slice(0, 3), mirrors.slice(3, 6)];
-      for (const batch of batches) {
+      const mirrors = pickNotubeMirrors(20);
+      const groups = [mirrors.slice(0, 10), mirrors.slice(10, 20)];
+      for (const group of groups) {
         const tmpPath = path.join(
           UPLOADS_DIR,
           `yt-${youtubeVideoId}-${fmt}-${Date.now()}.tmp.mp4`
         );
         try {
-          const downloadUrl = await Promise.any(
-            batch.map((m) => resolveDownloadUrlFromMirror(m, fmt))
+          onProgress?.(
+            24,
+            `Connecting to ${fmt === 'mp4hd' ? 'HD 720p/1080p' : 'MP4'} video stream...`
           );
+          const { mirror, token, nameMp4 } = await findFastestWeightMirror(group, fmt);
+          onProgress?.(
+            34,
+            `Preparing ${fmt === 'mp4hd' ? 'HD' : 'MP4'} source stream for compilation...`
+          );
+          const downloadUrl = await recoverAndResolveUrl(mirror, token, nameMp4, fmt);
+          onProgress?.(44, 'Downloading source video & audio stream to compiler...');
           await execFileAsync(
             'curl',
             ['-sL', '--max-time', '90', '-A', 'Mozilla/5.0', '-o', tmpPath, downloadUrl],
@@ -1635,12 +1682,13 @@ async function downloadYouTubeVideoMp4(youtubeVideoId: string): Promise<string |
             const dur = await probeVideoDuration(tmpPath);
             if (dur >= 5) {
               fs.renameSync(tmpPath, cachedPath);
+              onProgress?.(54, 'Extracting 48kHz audio energy & speech pause boundaries...');
               void extractRawAudioSignals(cachedPath);
               return cachedPath;
             }
           }
         } catch {
-          // Try next batch or format
+          // Try next group or format
         } finally {
           try {
             if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
@@ -1911,210 +1959,266 @@ async function runHighlightPipeline(jobId: string, channelAccessToken?: string):
       jobId,
       'retrieving_info',
       1,
-      16,
+      14,
       `Verified metadata for "${video.title}" (${formatTimestamp(video.duration)})`
     );
 
     const fixture = DEVELOPMENT_FIXTURES[video.youtube_video_id];
 
-    // Launch Media Download + Signal Extraction, Gemini Multimodal Analysis, and Engagement Check in PARALLEL
-    const mediaAndSignalsTask = (async (): Promise<SourceMediaSignals | null> => {
-      if (fixture?.hasPrebuiltSourceFile && job.source_media_status === 'fixture_ready') {
-        const fixtureMp4 = await ensureFixtureSourceVideo();
-        job.source_media_path = fixtureMp4;
-        job.source_media_duration = video.duration;
-        job.rights_confirmed = true;
-        saveDb();
-      } else if (!job.source_media_path && !video.is_fixture && video.youtube_video_id) {
-        const downloadedMp4 = await downloadYouTubeVideoMp4(video.youtube_video_id);
-        if (downloadedMp4 && fs.existsSync(downloadedMp4)) {
-          const realDur = await probeVideoDuration(downloadedMp4);
-          job.source_media_path = downloadedMp4;
+    // Dynamic progress ticker while downloading HD source & running multimodal analysis
+    let progressCeiling = 58;
+    const progressTicker = setInterval(() => {
+      const currentJob = db.jobs[jobId];
+      if (
+        !currentJob ||
+        currentJob.status === 'complete' ||
+        currentJob.status === 'failed'
+      ) {
+        clearInterval(progressTicker);
+        return;
+      }
+      if (currentJob.progress < progressCeiling) {
+        currentJob.progress = Math.min(progressCeiling, currentJob.progress + 2);
+      }
+    }, 650);
+
+    try {
+      // Launch Media Download + Signal Extraction, Gemini Multimodal Analysis, and Engagement Check in PARALLEL
+      const mediaAndSignalsTask = (async (): Promise<SourceMediaSignals | null> => {
+        if (fixture?.hasPrebuiltSourceFile && job.source_media_status === 'fixture_ready') {
+          const fixtureMp4 = await ensureFixtureSourceVideo();
+          job.source_media_path = fixtureMp4;
+          job.source_media_duration = video.duration;
+          job.rights_confirmed = true;
+          saveDb();
+        } else if (!job.source_media_path && !video.is_fixture && video.youtube_video_id) {
+          const downloadedMp4 = await downloadYouTubeVideoMp4(
+            video.youtube_video_id,
+            (pct, msg) => {
+              const currentJob = db.jobs[jobId];
+              if (currentJob && currentJob.status !== 'complete' && currentJob.status !== 'failed') {
+                currentJob.progress = Math.max(currentJob.progress, pct);
+                currentJob.stage_message = msg;
+              }
+            }
+          );
+          if (downloadedMp4 && fs.existsSync(downloadedMp4)) {
+            const realDur = await probeVideoDuration(downloadedMp4);
+            job.source_media_path = downloadedMp4;
+            job.source_media_duration = realDur;
+            job.rights_confirmed = true;
+            if (realDur >= 5) {
+              video.duration = realDur;
+              job.target_duration = calculateTargetDuration(
+                video.duration,
+                0.04,
+                activeKeepPct
+              ).targetSeconds;
+            }
+            saveDb();
+          }
+        }
+
+        return analyzeSourceMediaSignals(
+          job.source_media_path,
+          video.duration,
+          activeKeepPct
+        );
+      })();
+
+      updateJobStage(
+        jobId,
+        'analyzing_gemini',
+        2,
+        22,
+        'Fetching HD video stream and analyzing acoustic & semantic highlights...'
+      );
+
+      const geminiRawTask =
+        fixture || !video.original_url.startsWith('http') || video.duration > 600
+          ? Promise.resolve(null)
+          : fetchGeminiRawCandidates(video, activeKeepPct);
+
+      const engagementTask = fetchEngagementData(video.youtube_video_id, channelAccessToken);
+
+      const [mediaSignals, geminiRaw, engagement] = await Promise.all([
+        mediaAndSignalsTask,
+        geminiRawTask,
+        engagementTask,
+      ]);
+
+      progressCeiling = 68;
+      updateJobStage(
+        jobId,
+        'analyzing_gemini',
+        2,
+        62,
+        'Synthesizing Gemini multimodal highlights with speech-pause boundaries...'
+      );
+
+      const geminiResult = await analyzeVideoWithGemini(
+        video,
+        mediaSignals,
+        activeKeepPct,
+        geminiRaw
+      );
+
+      progressCeiling = 76;
+      updateJobStage(
+        jobId,
+        'checking_engagement',
+        3,
+        70,
+        'Correlating audience retention and acoustic prominence peaks...'
+      );
+      const { smoothedTimeline, peaks } = engagement.available
+        ? analyzeEngagementTimeline(engagement.observations, video.duration)
+        : { smoothedTimeline: [], peaks: [] };
+
+      updateJobStage(
+        jobId,
+        'identifying_moments',
+        4,
+        76,
+        `Evaluated ${geminiResult.highlights.length} candidate moments across the timeline...`,
+        {
+          engagement_available: engagement.available,
+          engagement_source: engagement.source,
+          engagement_timeline: smoothedTimeline,
+          video_summary: geminiResult.video_summary,
+          video_category: geminiResult.video_category,
+          analysis_mode: fixture ? 'development_fixture' : 'gemini_live',
+        }
+      );
+
+      progressCeiling = 86;
+      updateJobStage(
+        jobId,
+        'ranking_selecting',
+        5,
+        82,
+        `Selecting intro, highest-scoring best moments, and outro (${activeKeepPct}% of video length)...`
+      );
+
+      const coveredHighlights = ensureCandidateCoverageForTarget(
+        geminiResult.highlights,
+        video.duration,
+        activeKeepPct
+      );
+
+      const scoredCandidates = scoreAndMergeCandidates(coveredHighlights, peaks, {
+        engagementAvailable: engagement.available,
+        audioAvailable: true,
+        videoDuration: video.duration,
+      });
+
+      const selectedClips = selectHighlightReel(
+        scoredCandidates,
+        video.duration,
+        {
+          sceneBoundaries: fixture?.sceneBoundaries || [],
+          pauseBoundaries: mediaSignals?.pauseBoundaries || [],
+        },
+        activeKeepPct
+      );
+
+      const plannedDuration = selectedClips.reduce(
+        (sum, seg) => sum + (seg.end_time - seg.start_time),
+        0
+      );
+      const segmentRecords: HighlightSegmentRecord[] = selectedClips.map((seg, idx) => ({
+        id: `seg-${jobId}-${idx + 1}`,
+        job_id: jobId,
+        ...seg,
+        role: seg.role || classifySegmentRole(seg, video.duration),
+      }));
+      db.segments[jobId] = segmentRecords;
+
+      updateJobStage(
+        jobId,
+        'preparing_reel',
+        6,
+        86,
+        `Locked ${segmentRecords.length} chronological clips totaling ${formatTimestamp(
+          plannedDuration
+        )} (${activeKeepPct}% compiled)...`,
+        {
+          actual_output_duration: plannedDuration,
+        }
+      );
+
+      // Ensure source media is present before FFmpeg rendering (retry download if needed)
+      if ((!job.source_media_path || !fs.existsSync(job.source_media_path)) && !video.is_fixture && video.youtube_video_id) {
+        progressCeiling = 91;
+        const retryMp4 = await downloadYouTubeVideoMp4(
+          video.youtube_video_id,
+          (_pct, msg) => {
+            const currentJob = db.jobs[jobId];
+            if (currentJob && currentJob.status !== 'complete' && currentJob.status !== 'failed') {
+              currentJob.stage_message = msg;
+            }
+          }
+        );
+        if (retryMp4 && fs.existsSync(retryMp4)) {
+          const realDur = await probeVideoDuration(retryMp4);
+          job.source_media_path = retryMp4;
           job.source_media_duration = realDur;
           job.rights_confirmed = true;
-          if (realDur >= 5) {
-            video.duration = realDur;
-            job.target_duration = calculateTargetDuration(
-              video.duration,
-              0.04,
-              activeKeepPct
-            ).targetSeconds;
-          }
           saveDb();
         }
       }
 
-      return analyzeSourceMediaSignals(
-        job.source_media_path,
-        video.duration,
-        activeKeepPct
-      );
-    })();
+      if (job.source_media_path && fs.existsSync(job.source_media_path)) {
+        progressCeiling = 98;
+        updateJobStage(
+          jobId,
+          'rendering_video',
+          7,
+          90,
+          'Cutting and stitching HD H.264 video clips and 48kHz stereo audio with FFmpeg...',
+          { source_media_status: 'rendering' }
+        );
 
-    updateJobStage(
-      jobId,
-      'analyzing_gemini',
-      2,
-      44,
-      'Identifying intro, actual best moments, and outro across the video...'
-    );
+        const { outputPath, actualDuration } = await renderHighlightReelWithFfmpeg(
+          job,
+          video,
+          segmentRecords
+        );
 
-    const geminiRawTask =
-      fixture || !video.original_url.startsWith('http') || video.duration > 600
-        ? Promise.resolve(null)
-        : fetchGeminiRawCandidates(video, activeKeepPct);
-
-    const engagementTask = fetchEngagementData(video.youtube_video_id, channelAccessToken);
-
-    const [mediaSignals, geminiRaw, engagement] = await Promise.all([
-      mediaAndSignalsTask,
-      geminiRawTask,
-      engagementTask,
-    ]);
-
-    const geminiResult = await analyzeVideoWithGemini(
-      video,
-      mediaSignals,
-      activeKeepPct,
-      geminiRaw
-    );
-
-    updateJobStage(
-      jobId,
-      'checking_engagement',
-      3,
-      62,
-      'Checking audience retention and engagement signals...'
-    );
-    const { smoothedTimeline, peaks } = engagement.available
-      ? analyzeEngagementTimeline(engagement.observations, video.duration)
-      : { smoothedTimeline: [], peaks: [] };
-
-    updateJobStage(
-      jobId,
-      'identifying_moments',
-      4,
-      74,
-      `Identified ${geminiResult.highlights.length} candidate moments across the timeline...`,
-      {
-        engagement_available: engagement.available,
-        engagement_source: engagement.source,
-        engagement_timeline: smoothedTimeline,
-        video_summary: geminiResult.video_summary,
-        video_category: geminiResult.video_category,
-        analysis_mode: fixture ? 'development_fixture' : 'gemini_live',
-      }
-    );
-
-    updateJobStage(
-      jobId,
-      'ranking_selecting',
-      5,
-      82,
-      `Selecting intro, highest-scoring best moments, and outro (${activeKeepPct}% of video length)...`
-    );
-
-    const coveredHighlights = ensureCandidateCoverageForTarget(
-      geminiResult.highlights,
-      video.duration,
-      activeKeepPct
-    );
-
-    const scoredCandidates = scoreAndMergeCandidates(coveredHighlights, peaks, {
-      engagementAvailable: engagement.available,
-      audioAvailable: true,
-      videoDuration: video.duration,
-    });
-
-    const selectedClips = selectHighlightReel(
-      scoredCandidates,
-      video.duration,
-      {
-        sceneBoundaries: fixture?.sceneBoundaries || [],
-        pauseBoundaries: mediaSignals?.pauseBoundaries || [],
-      },
-      activeKeepPct
-    );
-
-    const plannedDuration = selectedClips.reduce(
-      (sum, seg) => sum + (seg.end_time - seg.start_time),
-      0
-    );
-    const segmentRecords: HighlightSegmentRecord[] = selectedClips.map((seg, idx) => ({
-      id: `seg-${jobId}-${idx + 1}`,
-      job_id: jobId,
-      ...seg,
-      role: seg.role || classifySegmentRole(seg, video.duration),
-    }));
-    db.segments[jobId] = segmentRecords;
-
-    updateJobStage(
-      jobId,
-      'preparing_reel',
-      6,
-      88,
-      `Selected ${segmentRecords.length} chronological clips totaling ${formatTimestamp(
-        plannedDuration
-      )} (${activeKeepPct}% compiled)...`,
-      {
-        actual_output_duration: plannedDuration,
-      }
-    );
-
-    if (job.source_media_path && fs.existsSync(job.source_media_path)) {
-      updateJobStage(
-        jobId,
-        'rendering_video',
-        7,
-        94,
-        'Cutting and stitching 720p HD video clips and audio with FFmpeg...',
-        { source_media_status: 'rendering' }
-      );
-
-      const { outputPath, actualDuration } = await renderHighlightReelWithFfmpeg(
-        job,
-        video,
-        segmentRecords
-      );
-
-      // If this was a private local video uploaded from the user's computer, remove the raw upload after rendering
-      if (
-        video.id.startsWith('vid-upload-') &&
-        job.source_media_path &&
-        job.source_media_path.startsWith(UPLOADS_DIR) &&
-        fs.existsSync(job.source_media_path)
-      ) {
-        try {
-          fs.unlinkSync(job.source_media_path);
-          job.source_media_path = undefined;
-        } catch {
-          // ignore cleanup error
+        // If this was a private local video uploaded from the user's computer, remove the raw upload after rendering
+        if (
+          video.id.startsWith('vid-upload-') &&
+          job.source_media_path &&
+          job.source_media_path.startsWith(UPLOADS_DIR) &&
+          fs.existsSync(job.source_media_path)
+        ) {
+          try {
+            fs.unlinkSync(job.source_media_path);
+            job.source_media_path = undefined;
+          } catch {
+            // ignore cleanup error
+          }
         }
-      }
 
-      updateJobStage(
-        jobId,
-        'complete',
-        8,
-        100,
-        'Highlight video compiled in HD and ready to watch.',
-        {
-          source_media_status: 'rendered',
-          download_location: outputPath,
-          actual_output_duration: actualDuration,
-        }
-      );
-    } else {
-      updateJobStage(
-        jobId,
-        'complete',
-        8,
-        100,
-        'Highlight video ready to watch.',
-        {
-          source_media_status: 'missing_source',
-        }
-      );
+        updateJobStage(
+          jobId,
+          'complete',
+          8,
+          100,
+          'Highlight video compiled in HD and ready to watch.',
+          {
+            source_media_status: 'rendered',
+            download_location: outputPath,
+            actual_output_duration: actualDuration,
+          }
+        );
+      } else {
+        throw new Error(
+          'Unable to download the source video stream from YouTube right now. Please click Try Again or upload the MP4 file directly.'
+        );
+      }
+    } finally {
+      clearInterval(progressTicker);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unexpected processing error.';
@@ -2197,6 +2301,13 @@ async function backfillMissingCompiledVideos(): Promise<void> {
     }
     if (job.status !== 'complete' && job.status !== 'failed') {
       void runHighlightPipeline(job.id);
+    } else if (
+      job.status === 'complete' &&
+      (job.source_media_status !== 'rendered' ||
+        !job.download_location ||
+        !fs.existsSync(job.download_location))
+    ) {
+      void runHighlightPipeline(job.id);
     }
   }
   if (modified) {
@@ -2210,6 +2321,8 @@ async function startServer() {
 
   ensureFixtureSourceVideo().catch(() => {});
   backfillMissingCompiledVideos().catch(() => {});
+  void downloadYouTubeVideoMp4('M7lc1UVf-VE').catch(() => {});
+  void downloadYouTubeVideoMp4('_OXtStBZyqs').catch(() => {});
 
   app.get('/api/system/status', (_req, res) => {
     const geminiConfigured = hasValidEnvKey(process.env.GEMINI_API_KEY, 'MY_GEMINI_API_KEY');
@@ -2519,6 +2632,13 @@ async function startServer() {
             job.source_media_path = await ensureFixtureSourceVideo();
             job.source_media_duration = video.duration;
             job.rights_confirmed = true;
+          } else if (video.youtube_video_id) {
+            const downloaded = await downloadYouTubeVideoMp4(video.youtube_video_id);
+            if (downloaded && fs.existsSync(downloaded)) {
+              job.source_media_path = downloaded;
+              job.source_media_duration = await probeVideoDuration(downloaded);
+              job.rights_confirmed = true;
+            }
           }
         }
         if (job.source_media_path && fs.existsSync(job.source_media_path)) {
@@ -2761,6 +2881,13 @@ async function startServer() {
             job.source_media_path = await ensureFixtureSourceVideo();
             job.source_media_duration = video.duration;
             job.rights_confirmed = true;
+          } else if (video.youtube_video_id) {
+            const downloaded = await downloadYouTubeVideoMp4(video.youtube_video_id);
+            if (downloaded && fs.existsSync(downloaded)) {
+              job.source_media_path = downloaded;
+              job.source_media_duration = await probeVideoDuration(downloaded);
+              job.rights_confirmed = true;
+            }
           }
         }
         if (job.source_media_path && fs.existsSync(job.source_media_path)) {

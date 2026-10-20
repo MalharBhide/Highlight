@@ -7,7 +7,6 @@ import {
   ArrowUpRight,
 } from 'lucide-react';
 import {
-  extractSharedReelJobId,
   MIN_KEEP_PERCENTAGE,
   MAX_KEEP_PERCENTAGE,
   DEFAULT_KEEP_PERCENTAGE,
@@ -55,7 +54,6 @@ export const HeroWorkspace: React.FC<HeroWorkspaceProps> = ({
   onUploadVideoFile,
 }) => {
   const fileUploadRef = useRef<HTMLInputElement | null>(null);
-  const isSharedReelInput = Boolean(extractSharedReelJobId(urlInput));
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -106,14 +104,6 @@ export const HeroWorkspace: React.FC<HeroWorkspaceProps> = ({
               type="text"
               value={urlInput}
               onChange={(e) => onUrlInputChange(e.target.value)}
-              onPaste={(e) => {
-                const pasted = e.clipboardData.getData('text').trim();
-                if (extractSharedReelJobId(pasted)) {
-                  e.preventDefault();
-                  onUrlInputChange(pasted);
-                  void onGenerateHighlights(pasted);
-                }
-              }}
               placeholder="https://www.youtube.com/watch?v=..."
               className={`flex-1 min-w-0 px-4 py-3.5 text-sm sm:text-base rounded-md border font-mono transition-colors focus:outline-none focus:ring-2 ${
                 darkMode
@@ -132,13 +122,7 @@ export const HeroWorkspace: React.FC<HeroWorkspaceProps> = ({
               ) : (
                 <Play className="w-4 h-4 fill-current" />
               )}
-              <span>
-                {creatingJob
-                  ? 'Compiling...'
-                  : isSharedReelInput
-                  ? 'Open Compiled Video'
-                  : 'Compile Video'}
-              </span>
+              <span>{creatingJob ? 'Compiling...' : 'Compile Video'}</span>
             </button>
           </form>
 

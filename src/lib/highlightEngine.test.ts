@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   extractYouTubeVideoId,
-  extractSharedReelJobId,
   parseIsoDuration,
   formatTimestamp,
   clampKeepPercentage,
@@ -36,19 +35,6 @@ test('extractYouTubeVideoId validates standard, short, and shorts URLs and rejec
   assert.equal(extractYouTubeVideoId('https://vimeo.com/123456789'), null);
   assert.equal(extractYouTubeVideoId('https://www.youtube.com/watch?v=short'), null);
   assert.equal(extractYouTubeVideoId(''), null);
-});
-
-test('extractSharedReelJobId extracts reel job IDs from query, hash, path, or raw ID', () => {
-  assert.equal(
-    extractSharedReelJobId('https://example.com/?reel=job-mvc45iwv-6j8a'),
-    'job-mvc45iwv-6j8a'
-  );
-  assert.equal(
-    extractSharedReelJobId('https://example.com/reel/job-seed-dev-keynote-01#reel=job-seed-dev-keynote-01'),
-    'job-seed-dev-keynote-01'
-  );
-  assert.equal(extractSharedReelJobId('job-mvc7hq50-rd4h'), 'job-mvc7hq50-rd4h');
-  assert.equal(extractSharedReelJobId('https://www.youtube.com/watch?v=M7lc1UVf-VE'), null);
 });
 
 test('parseIsoDuration parses YouTube Data API v3 ISO-8601 durations accurately', () => {

@@ -1,15 +1,10 @@
 import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import {
   Download,
-  Upload,
   Play,
   ArrowLeft,
   AlertCircle,
   Loader2,
-  Share2,
-  Check,
-  Copy,
-  ExternalLink,
   Trash2,
 } from 'lucide-react';
 import {
@@ -25,41 +20,6 @@ import {
   getOrCreateClientId,
   getOwnedJobIds,
 } from '../lib/clientSession';
-
-declare global {
-  interface Window {
-    YT?: {
-      Player: new (
-        element: HTMLElement | string,
-        options: {
-          videoId: string;
-          width?: string | number;
-          height?: string | number;
-          playerVars?: Record<string, string | number>;
-          events?: {
-            onReady?: (event: { target: YTPlayerInstance }) => void;
-            onStateChange?: (event: { data: number; target: YTPlayerInstance }) => void;
-            onError?: (event: { data: number }) => void;
-          };
-        }
-      ) => YTPlayerInstance;
-    };
-    onYouTubeIframeAPIReady?: () => void;
-  }
-}
-
-interface YTPlayerInstance {
-  playVideo: () => void;
-  pauseVideo: () => void;
-  seekTo: (seconds: number, allowSeekAhead: boolean) => void;
-  getCurrentTime: () => number;
-  getPlayerState: () => number;
-  mute: () => void;
-  unMute: () => void;
-  isMuted: () => boolean;
-  setVolume?: (volume: number) => void;
-  destroy: () => void;
-}
 
 interface ResultsViewProps {
   darkMode: boolean;
@@ -79,29 +39,6 @@ function formatRoleLabel(seg: HighlightSegmentRecord, duration: number): string 
   return 'Best Moment';
 }
 
-function copyTextSynchronously(text: string): boolean {
-  try {
-    const textarea = document.createElement('textarea');
-    textarea.value = text;
-    textarea.setAttribute('readonly', '');
-    textarea.style.position = 'fixed';
-    textarea.style.top = '0';
-    textarea.style.left = '0';
-    textarea.style.width = '1px';
-    textarea.style.height = '1px';
-    textarea.style.opacity = '0';
-    document.body.appendChild(textarea);
-    textarea.focus();
-    textarea.select();
-    textarea.setSelectionRange(0, text.length);
-    const ok = document.execCommand('copy');
-    document.body.removeChild(textarea);
-    return ok;
-  } catch {
-    return false;
-  }
-}
-
 export const ResultsView: React.FC<ResultsViewProps> = ({
   darkMode,
   job,
@@ -109,26 +46,14 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
   segments,
   onBackToWorkspace,
   onOpenAllReels,
-  onRefreshJob,
   onDeleteJob,
 }) => {
   const videoPlayerRef = useRef<HTMLVideoElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const ytContainerRef = useRef<HTMLDivElement | null>(null);
-  const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
-  const shareInputRef = useRef<HTMLInputElement | null>(null);
 
-  const [uploadingOrRendering, setUploadingOrRendering] = useState<boolean>(false);
   const [downloadingMp4, setDownloadingMp4] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [copiedShareLink, setCopiedShareLink] = useState<boolean>(false);
-  const [showSharePanel, setShowSharePanel] = useState<boolean>(false);
-  const copyResetTimerRef = useRef<number | null>(null);
-
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number>(0);
-  const [ytReady, setYtReady] = useState<boolean>(false);
 
-  const isMp4Ready = Boolean(job.download_ready && job.source_media_status === 'rendered');
   const isOwner = useMemo(() => {
     const clientId = getOrCreateClientId();
     const ownedSet = getOwnedJobIds();
@@ -138,47 +63,11 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
   }, [job.id, job.owner_client_id]);
 
   const encodedJobId = encodeURIComponent(job.id);
-  const shareUrl = `${window.location.origin}/?reel=${encodedJobId}#reel=${encodedJobId}`;
   const streamVersion = `${job.output_resolution_height || 720}-${Math.round(
     (job.actual_output_duration || 0) * 100
   )}`;
   const directMp4Url = `${window.location.origin}/api/highlights/${encodedJobId}/download`;
   const playbackMp4Url = `${directMp4Url}?v=${streamVersion}`;
-
-  useEffect(() => {
-    return () => {
-      if (copyResetTimerRef.current !== null) {
-        window.clearTimeout(copyResetTimerRef.current);
-      }
-    };
-  }, []);
-
-  const handleShareReel = () => {
-    setActionError(null);
-    setShowSharePanel(true);
-
-    // Run synchronous execCommand copy immediately during the active user click gesture
-    const syncCopied = copyTextSynchronously(shareUrl);
-
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      void navigator.clipboard.writeText(shareUrl).catch(() => {});
-    }
-
-    setCopiedShareLink(true);
-    if (copyResetTimerRef.current !== null) {
-      window.clearTimeout(copyResetTimerRef.current);
-    }
-    copyResetTimerRef.current = window.setTimeout(() => {
-      setCopiedShareLink(false);
-    }, 2500);
-
-    if (!syncCopied) {
-      setTimeout(() => {
-        shareInputRef.current?.focus();
-        shareInputRef.current?.select();
-      }, 40);
-    }
-  };
 
   const compiledTimeline = useMemo(() => {
     let offset = 0;
@@ -204,20 +93,17 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
 
   const activeSegmentIndexRef = useRef<number>(activeSegmentIndex);
   activeSegmentIndexRef.current = activeSegmentIndex;
-  const segmentsRef = useRef<HighlightSegmentRecord[]>(segments);
-  segmentsRef.current = segments;
 
   useEffect(() => {
     const el = videoPlayerRef.current;
-    if (!el || !isMp4Ready) return;
+    if (!el) return;
     el.muted = false;
     el.volume = 1.0;
     el.play().catch(() => {
-      // Fallback to muted autoplay when opening a shared link in a new tab without prior user interaction
       el.muted = true;
       void el.play().catch(() => {});
     });
-  }, [isMp4Ready, job.id]);
+  }, [job.id, playbackMp4Url]);
 
   const downloadFilename = useMemo(
     () => formatVideoDownloadFilename(video.title, video.youtube_video_id || job.id),
@@ -267,187 +153,13 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
       setActiveSegmentIndex(found.index);
       activeSegmentIndexRef.current = found.index;
 
-      if (isMp4Ready && videoPlayerRef.current) {
+      if (videoPlayerRef.current) {
         videoPlayerRef.current.currentTime = clamped;
         void videoPlayerRef.current.play().catch(() => {});
-      } else if (ytPlayerRef.current && ytReady) {
-        const offsetInsideClip = Math.max(0, clamped - found.compiledStart);
-        ytPlayerRef.current.seekTo(found.segment.start_time + offsetInsideClip, true);
-        ytPlayerRef.current.playVideo();
       }
     },
-    [compiledTimeline, isMp4Ready, ytReady]
+    [compiledTimeline]
   );
-
-  useEffect(() => {
-    if (isMp4Ready || video.is_fixture || !video.youtube_video_id) {
-      return;
-    }
-
-    let isCancelled = false;
-    const host = ytContainerRef.current;
-
-    const initPlayer = () => {
-      if (isCancelled || !host || !window.YT?.Player) return;
-
-      try {
-        if (ytPlayerRef.current) {
-          ytPlayerRef.current.destroy();
-          ytPlayerRef.current = null;
-        }
-      } catch {
-        // ignore cleanup
-      }
-
-      host.innerHTML = '';
-      const mountEl = document.createElement('div');
-      mountEl.style.width = '100%';
-      mountEl.style.height = '100%';
-      host.appendChild(mountEl);
-
-      const firstStart = Math.floor(segmentsRef.current[0]?.start_time || 0);
-      ytPlayerRef.current = new window.YT.Player(mountEl, {
-        videoId: video.youtube_video_id,
-        width: '100%',
-        height: '100%',
-        playerVars: {
-          autoplay: 1,
-          controls: 1,
-          rel: 0,
-          modestbranding: 1,
-          playsinline: 1,
-          start: firstStart,
-          origin: window.location.origin,
-        },
-        events: {
-          onReady: (event) => {
-            if (isCancelled) return;
-            setYtReady(true);
-            event.target.unMute();
-            if (typeof event.target.setVolume === 'function') {
-              event.target.setVolume(100);
-            }
-            const startSec = segmentsRef.current[0]?.start_time || 0;
-            event.target.seekTo(startSec, true);
-            event.target.playVideo();
-          },
-        },
-      });
-    };
-
-    if (window.YT?.Player) {
-      initPlayer();
-    } else {
-      const existingScript = document.querySelector(
-        'script[src="https://www.youtube.com/iframe_api"]'
-      );
-      const prevCallback = window.onYouTubeIframeAPIReady;
-      window.onYouTubeIframeAPIReady = () => {
-        if (prevCallback) prevCallback();
-        initPlayer();
-      };
-      if (!existingScript) {
-        const tag = document.createElement('script');
-        tag.src = 'https://www.youtube.com/iframe_api';
-        document.head.appendChild(tag);
-      }
-    }
-
-    return () => {
-      isCancelled = true;
-      try {
-        if (ytPlayerRef.current) {
-          ytPlayerRef.current.destroy();
-          ytPlayerRef.current = null;
-        }
-      } catch {
-        // ignore
-      }
-      if (host) {
-        host.innerHTML = '';
-      }
-    };
-  }, [isMp4Ready, video.is_fixture, video.youtube_video_id]);
-
-  useEffect(() => {
-    if (isMp4Ready || !ytReady || !ytPlayerRef.current || segments.length === 0) return;
-
-    const timer = setInterval(() => {
-      const player = ytPlayerRef.current;
-      if (!player || typeof player.getCurrentTime !== 'function') return;
-
-      try {
-        const state = player.getPlayerState();
-        if (state !== 1) return;
-
-        const rawTime = player.getCurrentTime();
-        const currIdx = activeSegmentIndexRef.current;
-        const currItem = compiledTimeline.items[currIdx];
-        if (!currItem) return;
-
-        const { segment } = currItem;
-
-        if (rawTime >= segment.end_time - 0.15) {
-          if (currIdx < compiledTimeline.items.length - 1) {
-            const nextIdx = currIdx + 1;
-            const nextItem = compiledTimeline.items[nextIdx];
-            activeSegmentIndexRef.current = nextIdx;
-            setActiveSegmentIndex(nextIdx);
-            player.seekTo(nextItem.segment.start_time, true);
-            player.playVideo();
-          } else {
-            player.pauseVideo();
-          }
-          return;
-        }
-
-        if (rawTime < segment.start_time - 1.5) {
-          player.seekTo(segment.start_time, true);
-        }
-      } catch {
-        // ignore transient player read errors
-      }
-    }, 120);
-
-    return () => clearInterval(timer);
-  }, [isMp4Ready, ytReady, segments, compiledTimeline]);
-
-  const handleAutoUploadAndCompile = async (file: File) => {
-    setActionError(null);
-
-    try {
-      setUploadingOrRendering(true);
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('rightsConfirmed', 'true');
-      formData.append('syncDuration', 'true');
-
-      const sourceRes = await fetch(`/api/highlights/${job.id}/source`, {
-        method: 'POST',
-        headers: getClientHeaders(),
-        body: formData,
-      });
-      const sourceData = (await sourceRes.json()) as { error?: string };
-      if (!sourceRes.ok) {
-        throw new Error(sourceData.error || 'Failed to upload video file.');
-      }
-
-      const renderRes = await fetch(`/api/highlights/${job.id}/render`, {
-        method: 'POST',
-        headers: getClientHeaders(),
-      });
-      const renderData = (await renderRes.json()) as { error?: string };
-      if (!renderRes.ok) {
-        throw new Error(renderData.error || 'Failed to compile MP4 highlight video.');
-      }
-
-      await onRefreshJob();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Failed to compile highlight video.');
-    } finally {
-      setUploadingOrRendering(false);
-    }
-  };
 
   return (
     <section
@@ -494,31 +206,6 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
           </div>
 
           <div className="flex items-center gap-2.5 shrink-0">
-            <button
-              type="button"
-              onClick={() => void handleShareReel()}
-              data-testid="share-reel-button"
-              className={`inline-flex items-center gap-2 px-4 py-2.5 text-xs sm:text-sm font-semibold rounded-md border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                darkMode
-                  ? 'bg-[#0b0f14] border-[#1a2634] text-[#ecfeff] hover:bg-[#111922] hover:border-[#22d3ee]/50'
-                  : 'bg-white border-[#dcd6ca] text-[#141311] hover:bg-[#ebe6dc]'
-              }`}
-            >
-              {copiedShareLink ? (
-                <>
-                  <Check
-                    className={`w-4 h-4 ${darkMode ? 'text-[#22d3ee]' : 'text-[#d9381e]'}`}
-                  />
-                  <span>Link Copied</span>
-                </>
-              ) : (
-                <>
-                  <Share2 className="w-4 h-4" />
-                  <span>Share</span>
-                </>
-              )}
-            </button>
-
             {isOwner && onDeleteJob && (
               <button
                 type="button"
@@ -535,150 +222,25 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
               </button>
             )}
 
-            <input
-              ref={fileInputRef}
-              id="source-video-upload"
-              type="file"
-              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,.mp4,.mov,.webm,.mkv"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) {
-                  void handleAutoUploadAndCompile(file);
-                }
-                e.target.value = '';
-              }}
-            />
-
             {isOwner && (
-              isMp4Ready ? (
-                <button
-                  type="button"
-                  data-testid="download-mp4-button"
-                  data-download-filename={downloadFilename}
-                  disabled={downloadingMp4}
-                  onClick={() => void handleDownloadMp4()}
-                  className="btn-accent inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold rounded-md whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-                >
-                  {downloadingMp4 ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Download className="w-4 h-4" />
-                  )}
-                  <span>{downloadingMp4 ? 'Downloading...' : 'Download Video (.MP4)'}</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  disabled={uploadingOrRendering}
-                  onClick={() => fileInputRef.current?.click()}
-                  className="btn-accent inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold rounded-md cursor-pointer disabled:opacity-50"
-                >
-                  {uploadingOrRendering ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Upload className="w-4 h-4" />
-                  )}
-                  <span>{uploadingOrRendering ? 'Compiling Video...' : 'Compile .MP4 from File'}</span>
-                </button>
-              )
+              <button
+                type="button"
+                data-testid="download-mp4-button"
+                data-download-filename={downloadFilename}
+                disabled={downloadingMp4}
+                onClick={() => void handleDownloadMp4()}
+                className="btn-accent inline-flex items-center gap-2 px-5 py-2.5 text-xs sm:text-sm font-semibold rounded-md whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+              >
+                {downloadingMp4 ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+                <span>{downloadingMp4 ? 'Downloading...' : 'Download Video (.MP4)'}</span>
+              </button>
             )}
           </div>
         </div>
-
-        {showSharePanel && (
-          <div
-            data-testid="share-reel-panel"
-            className={`mb-5 p-4 rounded-lg border flex flex-col gap-3 ${
-              darkMode ? 'surface-card-dark' : 'surface-card-light'
-            }`}
-          >
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-xs sm:text-sm font-semibold">
-                <Check
-                  className={`w-4 h-4 shrink-0 ${
-                    darkMode ? 'text-[#22d3ee]' : 'text-[#d9381e]'
-                  }`}
-                />
-                <span>Direct link to this compiled highlight reel</span>
-              </div>
-              <div className="flex items-center gap-3 text-xs font-medium">
-                <a
-                  href={shareUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  data-testid="open-shared-reel-link"
-                  className={`inline-flex items-center gap-1 hover:underline underline-offset-4 ${
-                    darkMode ? 'text-[#22d3ee]' : 'text-[#d9381e]'
-                  }`}
-                >
-                  <span>Open Shared Reel</span>
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
-                {isMp4Ready && (
-                  <>
-                    <span aria-hidden="true" className={darkMode ? 'text-[#64748b]' : 'text-[#857f75]'}>
-                      ·
-                    </span>
-                    <a
-                      href={directMp4Url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      data-testid="open-direct-mp4-link"
-                      className={`inline-flex items-center gap-1 hover:underline underline-offset-4 ${
-                        darkMode
-                          ? 'text-[#94a3b8] hover:text-[#ecfeff]'
-                          : 'text-[#57534c] hover:text-[#141311]'
-                      }`}
-                    >
-                      <span>Direct MP4 Stream</span>
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  </>
-                )}
-              </div>
-            </div>
-
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-              <label htmlFor="share-reel-url-input" className="sr-only">
-                Shareable Highlight Reel Link
-              </label>
-              <input
-                ref={shareInputRef}
-                id="share-reel-url-input"
-                data-testid="share-url-input"
-                type="text"
-                readOnly
-                value={shareUrl}
-                onFocus={(e) => e.currentTarget.select()}
-                onClick={(e) => e.currentTarget.select()}
-                className={`flex-1 min-w-0 px-3.5 py-2 text-xs sm:text-sm font-mono rounded-md border focus:outline-none focus:ring-2 ${
-                  darkMode
-                    ? 'bg-[#05070a] border-[#1a2634] text-[#ecfeff] focus:ring-[#22d3ee]'
-                    : 'bg-[#f5f2eb] border-[#dcd6ca] text-[#141311] focus:ring-[#d9381e]'
-                }`}
-              />
-              <button
-                type="button"
-                data-testid="copy-share-url-button"
-                onClick={() => void handleShareReel()}
-                className="btn-accent inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-md cursor-pointer whitespace-nowrap shrink-0"
-              >
-                {copiedShareLink ? (
-                  <>
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Copy Link</span>
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        )}
 
         {actionError && (
           <div
@@ -698,46 +260,37 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
           </div>
         )}
 
-        {/* Compiled Highlight Video Player (Native Video Controls Only) */}
+        {/* Compiled Highlight Video Player (Shows ONLY the Compiled MP4 Video) */}
         <div
           className={`rounded-lg border overflow-hidden ${
             darkMode ? 'surface-card-dark' : 'surface-card-light'
           }`}
         >
           <div className="aspect-video w-full bg-black relative">
-            {isMp4Ready ? (
-              <video
-                key={playbackMp4Url}
-                ref={videoPlayerRef}
-                data-testid="rendered-mp4-player"
-                src={playbackMp4Url}
-                controls
-                controlsList={isOwner ? undefined : 'nodownload'}
-                autoPlay
-                playsInline
-                preload="auto"
-                onTimeUpdate={(e) => {
-                  const t = e.currentTarget.currentTime;
-                  const found = compiledTimeline.items.find(
-                    (it) => t >= it.compiledStart && t <= it.compiledEnd
-                  );
-                  if (found && found.index !== activeSegmentIndexRef.current) {
-                    activeSegmentIndexRef.current = found.index;
-                    setActiveSegmentIndex(found.index);
-                  }
-                }}
-                className="w-full h-full object-contain bg-black"
-              >
-                Your browser does not support HTML5 video playback.
-              </video>
-            ) : (
-              <div
-                data-testid="compiled-youtube-player"
-                className="w-full h-full relative bg-black"
-              >
-                <div ref={ytContainerRef} className="w-full h-full" />
-              </div>
-            )}
+            <video
+              key={playbackMp4Url}
+              ref={videoPlayerRef}
+              data-testid="rendered-mp4-player"
+              src={playbackMp4Url}
+              controls
+              controlsList={isOwner ? undefined : 'nodownload'}
+              autoPlay
+              playsInline
+              preload="auto"
+              onTimeUpdate={(e) => {
+                const t = e.currentTarget.currentTime;
+                const found = compiledTimeline.items.find(
+                  (it) => t >= it.compiledStart && t <= it.compiledEnd
+                );
+                if (found && found.index !== activeSegmentIndexRef.current) {
+                  activeSegmentIndexRef.current = found.index;
+                  setActiveSegmentIndex(found.index);
+                }
+              }}
+              className="w-full h-full object-contain bg-black"
+            >
+              Your browser does not support HTML5 video playback.
+            </video>
           </div>
         </div>
 

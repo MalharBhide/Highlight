@@ -254,32 +254,6 @@ export function extractYouTubeVideoId(rawUrl: string): string | null {
 }
 
 /**
- * Extracts a Highlight reel job ID (e.g., "job-mvc45iwv-6j8a" or "job-seed-dev-keynote-01")
- * from a shared URL (?reel=..., #reel=..., /reel/..., /watch/..., /api/highlights/...) or raw job ID string.
- */
-export function extractSharedReelJobId(rawInput: string): string | null {
-  if (!rawInput || typeof rawInput !== 'string') return null;
-  const trimmed = rawInput.trim();
-  if (!trimmed) return null;
-
-  if (/^job-[A-Za-z0-9_-]{4,}$/.test(trimmed)) {
-    return trimmed;
-  }
-
-  const queryOrHashMatch = trimmed.match(/(?:[?&#](?:reel|job)=)(job-[A-Za-z0-9_-]{4,})/i);
-  if (queryOrHashMatch && queryOrHashMatch[1]) {
-    return decodeURIComponent(queryOrHashMatch[1]);
-  }
-
-  const pathMatch = trimmed.match(/\/(?:reel|watch|highlights)\/(job-[A-Za-z0-9_-]{4,})/i);
-  if (pathMatch && pathMatch[1]) {
-    return decodeURIComponent(pathMatch[1]);
-  }
-
-  return null;
-}
-
-/**
  * Parses ISO 8601 duration strings from YouTube Data API v3 (e.g. "PT15M33S", "PT1H2M10S")
  */
 export function parseIsoDuration(iso: string): number {

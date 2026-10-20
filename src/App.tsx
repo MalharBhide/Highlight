@@ -4,7 +4,6 @@
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Loader2 } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { HeroWorkspace } from './components/HeroWorkspace';
 import { ProcessingView } from './components/ProcessingView';
@@ -13,7 +12,6 @@ import { AllReelsView } from './components/AllReelsView';
 import { LandingSections, type RecentJobSummary } from './components/LandingSections';
 import {
   extractYouTubeVideoId,
-  extractSharedReelJobId,
   clampKeepPercentage,
   DEFAULT_KEEP_PERCENTAGE,
   type HighlightJobRecord,
@@ -28,16 +26,9 @@ import {
 
 type ActiveScreen = 'home' | 'processing' | 'results' | 'reels';
 
-function getInitialSharedReelId(): string | null {
-  if (typeof window === 'undefined') return null;
-  return extractSharedReelJobId(window.location.href);
-}
-
 export default function App() {
-  const initialSharedId = getInitialSharedReelId();
   const [darkMode, setDarkMode] = useState<boolean>(false);
-  const [screen, setScreen] = useState<ActiveScreen>(initialSharedId ? 'results' : 'home');
-  const [loadingSharedReel, setLoadingSharedReel] = useState<boolean>(Boolean(initialSharedId));
+  const [screen, setScreen] = useState<ActiveScreen>('home');
   const [urlInput, setUrlInput] = useState<string>('');
   const [keepPercentage, setKeepPercentage] = useState<number>(DEFAULT_KEEP_PERCENTAGE);
   const [creatingJob, setCreatingJob] = useState<boolean>(false);
@@ -69,53 +60,45 @@ export default function App() {
 
   const loadJobDetails = useCallback(
     async (jobId: string) => {
-      try {
-        const res = await fetch(`/api/highlights/${encodeURIComponent(jobId)}`, {
-          headers: getClientHeaders(),
-        });
-        if (!res.ok) {
-          setLoadingSharedReel(false);
-          setScreen('home');
-          setErrorMsg('The requested shared highlight reel could not be found.');
-          return;
-        }
-        const data = (await res.json()) as {
-          job: HighlightJobRecord & { download_ready?: boolean };
-          video: VideoRecord;
-          segments?: HighlightSegmentRecord[];
-        };
+      const res = await fetch(`/api/highlights/${encodeURIComponent(jobId)}`, {
+        headers: getClientHeaders(),
+      });
+      if (!res.ok) {
+        setScreen('home');
+        setErrorMsg('The requested highlight reel could not be found.');
+        return;
+      }
+      const data = (await res.json()) as {
+        job: HighlightJobRecord & { download_ready?: boolean };
+        video: VideoRecord;
+        segments?: HighlightSegmentRecord[];
+      };
 
-        if (data.job.status === 'complete') {
-          let resolvedSegments = data.segments;
-          if (!resolvedSegments) {
-            const segRes = await fetch(`/api/highlights/${encodeURIComponent(jobId)}/segments`, {
-              headers: getClientHeaders(),
-            });
-            if (segRes.ok) {
-              const segData = (await segRes.json()) as { segments?: HighlightSegmentRecord[] };
-              resolvedSegments = segData.segments || [];
-            }
+      if (data.job.status === 'complete') {
+        let resolvedSegments = data.segments;
+        if (!resolvedSegments) {
+          const segRes = await fetch(`/api/highlights/${encodeURIComponent(jobId)}/segments`, {
+            headers: getClientHeaders(),
+          });
+          if (segRes.ok) {
+            const segData = (await segRes.json()) as { segments?: HighlightSegmentRecord[] };
+            resolvedSegments = segData.segments || [];
           }
-          setActiveJob(data.job);
-          setActiveVideo(data.video);
-          setActiveSegments(resolvedSegments || []);
-          setScreen('results');
-          const encoded = encodeURIComponent(jobId);
-          const nextUrl = `/?reel=${encoded}#reel=${encoded}`;
-          window.history.replaceState(null, '', nextUrl);
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-          void fetchRecentJobs();
-        } else {
-          setActiveJob(data.job);
-          setActiveVideo(data.video);
-          if (data.job.keep_percentage !== undefined) {
-            setKeepPercentage(clampKeepPercentage(data.job.keep_percentage));
-          }
-          setScreen('processing');
-          window.scrollTo({ top: 0, behavior: 'smooth' });
         }
-      } finally {
-        setLoadingSharedReel(false);
+        setActiveJob(data.job);
+        setActiveVideo(data.video);
+        setActiveSegments(resolvedSegments || []);
+        setScreen('results');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        void fetchRecentJobs();
+      } else {
+        setActiveJob(data.job);
+        setActiveVideo(data.video);
+        if (data.job.keep_percentage !== undefined) {
+          setKeepPercentage(clampKeepPercentage(data.job.keep_percentage));
+        }
+        setScreen('processing');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
       }
     },
     [fetchRecentJobs]
@@ -123,32 +106,12 @@ export default function App() {
 
   useEffect(() => {
     void fetchRecentJobs();
-    const sharedReelId = extractSharedReelJobId(window.location.href);
-    if (sharedReelId) {
-      setLoadingSharedReel(true);
-      void loadJobDetails(sharedReelId);
-    }
-
-    const handleUrlChange = () => {
-      const nextSharedId = extractSharedReelJobId(window.location.href);
-      if (nextSharedId) {
-        setLoadingSharedReel(true);
-        void loadJobDetails(nextSharedId);
-      }
-    };
-
-    window.addEventListener('popstate', handleUrlChange);
-    window.addEventListener('hashchange', handleUrlChange);
-    return () => {
-      window.removeEventListener('popstate', handleUrlChange);
-      window.removeEventListener('hashchange', handleUrlChange);
-    };
-  }, [fetchRecentJobs, loadJobDetails]);
+  }, [fetchRecentJobs]);
 
   useEffect(() => {
     if (screen !== 'home') return;
     const trimmed = urlInput.trim();
-    if (!trimmed || extractSharedReelJobId(trimmed)) return;
+    if (!trimmed) return;
     const vidId = extractYouTubeVideoId(trimmed);
     if (!vidId) return;
 
@@ -195,18 +158,10 @@ export default function App() {
       return;
     }
 
-    // If the user pastes a direct Share link to an existing compiled reel, open that compiled reel directly
-    const sharedJobId = extractSharedReelJobId(raw);
-    if (sharedJobId) {
-      setLoadingSharedReel(true);
-      await loadJobDetails(sharedJobId);
-      return;
-    }
-
     const videoId = extractYouTubeVideoId(raw);
     if (!videoId) {
       setErrorMsg(
-        'Invalid YouTube URL. Supported formats: youtube.com/watch?v=ID, youtu.be/ID, youtube.com/shorts/ID, or a shared Highlight reel link.'
+        'Invalid YouTube URL. Supported formats: youtube.com/watch?v=ID, youtu.be/ID, or youtube.com/shorts/ID.'
       );
       return;
     }
@@ -306,7 +261,6 @@ export default function App() {
       removeOwnedJobId(jobId);
       setRecentJobs((prev) => prev.filter((item) => item.job.id !== jobId));
       if (activeJob?.id === jobId) {
-        window.history.replaceState(null, '', '/');
         setActiveJob(null);
         setActiveVideo(null);
         setActiveSegments([]);
@@ -317,14 +271,10 @@ export default function App() {
   );
 
   const handleNavigateHome = () => {
-    window.history.replaceState(null, '', '/');
-    setLoadingSharedReel(false);
     setScreen('home');
   };
 
   const handleFocusInput = () => {
-    window.history.replaceState(null, '', '/');
-    setLoadingSharedReel(false);
     if (screen !== 'home') {
       setScreen('home');
       setTimeout(() => {
@@ -336,8 +286,6 @@ export default function App() {
   };
 
   const handleOpenAllReels = () => {
-    window.history.replaceState(null, '', '/');
-    setLoadingSharedReel(false);
     void fetchRecentJobs();
     setScreen('reels');
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -356,20 +304,7 @@ export default function App() {
       />
 
       <main>
-        {loadingSharedReel && (!activeJob || !activeVideo) && (
-          <section className="py-24 px-6 flex items-center justify-center">
-            <div className="inline-flex items-center gap-2.5 font-mono text-sm">
-              <Loader2
-                className={`w-4 h-4 animate-spin ${
-                  darkMode ? 'text-[#22d3ee]' : 'text-[#d9381e]'
-                }`}
-              />
-              <span>Opening compiled highlight video...</span>
-            </div>
-          </section>
-        )}
-
-        {!loadingSharedReel && screen === 'home' && (
+        {screen === 'home' && (
           <>
             <HeroWorkspace
               darkMode={darkMode}
