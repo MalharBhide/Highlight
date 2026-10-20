@@ -88,8 +88,12 @@ export default function App() {
         setActiveJob(data.job);
         setActiveVideo(data.video);
         setActiveSegments(resolvedSegments || []);
-        setScreen('results');
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+        setScreen((prev) => {
+          if (prev !== 'results') {
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }
+          return 'results';
+        });
         void fetchRecentJobs();
       } else {
         setActiveJob(data.job);
@@ -97,8 +101,12 @@ export default function App() {
         if (data.job.keep_percentage !== undefined) {
           setKeepPercentage(clampKeepPercentage(data.job.keep_percentage));
         }
-        setScreen('processing');
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+        setScreen((prev) => {
+          if (prev !== 'processing') {
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }
+          return 'processing';
+        });
       }
     },
     [fetchRecentJobs]
@@ -119,31 +127,48 @@ export default function App() {
       void fetch('/api/videos/inspect', {
         method: 'POST',
         headers: getClientHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ url: trimmed, keepPercentage }),
+        body: JSON.stringify({ url: trimmed }),
       }).catch(() => {
         // ignore pre-warm network errors
       });
-    }, 200);
+    }, 350);
 
     return () => clearTimeout(timer);
-  }, [screen, urlInput, keepPercentage]);
+  }, [screen, urlInput]);
+
+  const activeJobId = activeJob?.id;
+  const activeJobStatus = activeJob?.status;
 
   useEffect(() => {
-    if (screen !== 'processing' || !activeJob) return;
-    if (activeJob.status === 'complete' || activeJob.status === 'failed') return;
+    if (screen !== 'processing' || !activeJobId) return;
+    if (activeJobStatus === 'complete' || activeJobStatus === 'failed') return;
+
+    let cancelled = false;
+    let inFlight = false;
+
+    const poll = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        await loadJobDetails(activeJobId);
+      } finally {
+        inFlight = false;
+      }
+    };
 
     const initialPoll = setTimeout(() => {
-      void loadJobDetails(activeJob.id);
-    }, 120);
+      void poll();
+    }, 150);
     const timer = setInterval(() => {
-      void loadJobDetails(activeJob.id);
-    }, 250);
+      void poll();
+    }, 450);
 
     return () => {
+      cancelled = true;
       clearTimeout(initialPoll);
       clearInterval(timer);
     };
-  }, [screen, activeJob, loadJobDetails]);
+  }, [screen, activeJobId, activeJobStatus, loadJobDetails]);
 
   const handleGenerateHighlights = async (
     targetUrl?: string,

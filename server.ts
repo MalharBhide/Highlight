@@ -7,7 +7,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type, ThinkingLevel, MediaResolution } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import {
   extractYouTubeVideoId,
   parseIsoDuration,
@@ -601,7 +601,7 @@ async function inspectYouTubeVideo(
 
   if (!detectedDuration) {
     try {
-      const mirrors = pickNotubeMirrors(4);
+      const mirrors = pickNotubeMirrors(2);
       const weightDur = await Promise.any(
         mirrors.map(async (mirror) => {
           const weightRes = await fetch(`${mirror}/recover_weight.php`, {
@@ -609,23 +609,25 @@ async function inspectYouTubeVideo(
             headers: {
               'Content-Type': 'application/x-www-form-urlencoded',
               'User-Agent': 'Mozilla/5.0',
+              Origin: 'https://notube.net',
+              Referer: 'https://notube.net/',
             },
             body: `url=${encodeURIComponent(canonicalUrl)}&format=mp4hd&lang=en&subscribed=false`,
-            signal: AbortSignal.timeout(7000),
+            signal: AbortSignal.timeout(5000),
           });
           if (!weightRes.ok) throw new Error('Mirror failed');
           const weightData = (await weightRes.json()) as { url_mp4_youtube?: string };
           const durMatch = weightData.url_mp4_youtube?.match(/[?&]dur=([0-9.]+)/);
           if (durMatch && durMatch[1]) {
             const parsedDur = parseFloat(durMatch[1]);
-            if (Number.isFinite(parsedDur) && parsedDur >= 5) {
+            if (Number.isFinite(parsedDur) && parsedDur >= 2) {
               return parsedDur;
             }
           }
           throw new Error('No duration found');
         })
       );
-      if (weightDur >= 5) {
+      if (weightDur >= 2) {
         detectedDuration = weightDur;
       }
     } catch {
@@ -968,13 +970,20 @@ function buildResilientFallbackAnalysis(
   const validPct = clampKeepPercentage(keepPercentage);
   const target = calculateTargetDuration(dur, 0.04, validPct).targetSeconds;
 
-  const introEnd = mediaSignals?.introEnd ?? target * 0.143;
-  const outroStart = mediaSignals?.outroStart ?? dur - target * 0.131;
+  const minSegSpan = Math.min(dur * 0.35, Math.max(1.2, dur * 0.025));
+  const introEnd = Math.min(
+    dur * 0.35,
+    Math.max(minSegSpan, mediaSignals?.introEnd ?? target * 0.143)
+  );
+  const outroStart = Math.max(
+    dur * 0.65,
+    Math.min(dur - minSegSpan, mediaSignals?.outroStart ?? dur - target * 0.131)
+  );
 
   const highlights: AICandidateHighlight[] = [
     {
       start_time: 0,
-      end_time: Math.max(dur * 0.015, introEnd),
+      end_time: introEnd,
       title: `Intro — Opening Hook & Setup`,
       description: `Opening introduction and premise from ${video.channel}.`,
       semantic_score: 0.91,
@@ -1020,9 +1029,10 @@ function buildResilientFallbackAnalysis(
   if (mediaSignals && mediaSignals.energyPeaks.length > 0) {
     mediaSignals.energyPeaks.forEach((pk, idx) => {
       const tpl = bodyDescriptions[idx % bodyDescriptions.length];
+      const pkEnd = Math.min(dur, Math.max(pk.end_time, pk.start_time + minSegSpan));
       highlights.push({
         start_time: pk.start_time,
-        end_time: pk.end_time,
+        end_time: pkEnd,
         title: tpl.title,
         description: tpl.description,
         semantic_score: pk.semantic_score,
@@ -1035,10 +1045,10 @@ function buildResilientFallbackAnalysis(
     });
   } else {
     bodyDescriptions.slice(0, 3).forEach((tpl, idx) => {
-      const segLen = target * tpl.spanFactor;
+      const segLen = Math.max(minSegSpan, target * tpl.spanFactor);
       const s = Math.max(introEnd + dur * 0.01, dur * tpl.ratio);
       const e = Math.min(outroStart - dur * 0.01, s + segLen);
-      if (e - s >= dur * 0.015) {
+      if (e - s >= 0.5) {
         highlights.push({
           start_time: s,
           end_time: e,
@@ -1056,7 +1066,7 @@ function buildResilientFallbackAnalysis(
   }
 
   highlights.push({
-    start_time: Math.min(dur - dur * 0.015, outroStart),
+    start_time: outroStart,
     end_time: dur,
     title: 'Outro — Final Reaction & Closing Sign-Off',
     description: `Closing wrap-up and final moments of "${video.title}".`,
@@ -1398,83 +1408,42 @@ Return between 7 and 12 non-overlapping candidate segments spanning the video du
         required: ['video_summary', 'video_category', 'highlights'],
       };
 
-      // Step 1: Attempt direct multimodal video analysis for short/medium YouTube videos when running before telemetry
-      if (!mediaSignals && video.original_url.startsWith('http') && video.duration <= 600) {
-        const multimodalResponse = await withSoftTimeout(
-          ai.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: [
-              {
-                fileData: {
-                  fileUri: video.original_url,
-                  mimeType: 'video/mp4',
+      // Race telemetry-grounded Gemini models in parallel with a crisp 5.5s timeout
+      try {
+        const modelsToRace = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] as const;
+        const validated = await Promise.any(
+          modelsToRace.map(async (modelName) => {
+            const fastResponse = await withSoftTimeout(
+              ai.models.generateContent({
+                model: modelName,
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  responseSchema,
+                  thinkingConfig: {
+                    thinkingLevel:
+                      modelName === 'gemini-3.1-flash-lite'
+                        ? ThinkingLevel.MINIMAL
+                        : ThinkingLevel.LOW,
+                  },
                 },
-              },
-              { text: prompt },
-            ],
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema,
-              mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            },
-          }),
-          14000
-        );
-
-        const mmText = multimodalResponse?.text;
-        if (mmText) {
-          try {
-            const parsed = JSON.parse(mmText);
-            const validated = validateAndClampAICandidates(parsed, video.duration);
-            if (validated.highlights.length > 0) {
-              geminiCandidateCache[video.youtube_video_id] = validated;
-              saveGeminiCandidateCache();
-              return validated;
-            }
-          } catch {
-            // Fall through to telemetry-grounded Gemini analysis
-          }
-        }
-      }
-
-      // Step 2: Fast telemetry-grounded Gemini analysis (completes in ~1.5s without video ingestion timeouts)
-      for (const modelName of ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] as const) {
-        const fastResponse = await withSoftTimeout(
-          ai.models.generateContent({
-            model: modelName,
-            contents: prompt,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema,
-              thinkingConfig: {
-                thinkingLevel:
-                  modelName === 'gemini-3.1-flash-lite'
-                    ? ThinkingLevel.MINIMAL
-                    : ThinkingLevel.LOW,
-              },
-            },
-          }),
-          12000
-        );
-
-        const text = fastResponse?.text;
-        if (text) {
-          try {
+              }),
+              5500
+            );
+            const text = fastResponse?.text;
+            if (!text) throw new Error('Empty response');
             const parsed = JSON.parse(text);
-            const validated = validateAndClampAICandidates(parsed, video.duration);
-            if (validated.highlights.length > 0) {
-              geminiCandidateCache[video.youtube_video_id] = validated;
-              saveGeminiCandidateCache();
-              return validated;
-            }
-          } catch {
-            // Try next model
-          }
-        }
+            const res = validateAndClampAICandidates(parsed, video.duration);
+            if (res.highlights.length === 0) throw new Error('No valid highlights');
+            return res;
+          })
+        );
+        geminiCandidateCache[video.youtube_video_id] = validated;
+        saveGeminiCandidateCache();
+        return validated;
+      } catch {
+        return null;
       }
-
-      return null;
     } finally {
       activeGeminiAnalyses.delete(inFlightKey);
     }
@@ -1515,12 +1484,14 @@ async function analyzeVideoWithGemini(
 
   if (rawSchema && rawSchema.highlights.length > 0) {
     const clamped = validateAndClampAICandidates(rawSchema, video.duration);
-    return alignAndEnrichCandidatesWithMediaSignals(
-      clamped,
-      video.duration,
-      mediaSignals,
-      validPct
-    );
+    if (clamped.highlights.length > 0) {
+      return alignAndEnrichCandidatesWithMediaSignals(
+        clamped,
+        video.duration,
+        mediaSignals,
+        validPct
+      );
+    }
   }
 
   return buildResilientFallbackAnalysis(video, mediaSignals, validPct);
@@ -1528,6 +1499,7 @@ async function analyzeVideoWithGemini(
 
 /**
  * Downloads the actual YouTube video MP4 (with moving video and audio) to local storage
+ * using a multi-provider stream engine (Etacloud Fast MP4 + Savenow/LBServer HD 720p + Notube Mirrors)
  * so FFmpeg can cut and stitch the real video clips with audio and zero text overlays.
  */
 const activeYouTubeDownloads = new Map<string, Promise<string | null>>();
@@ -1541,10 +1513,10 @@ async function downloadYouTubeVideoMp4(
   }
 
   const cachedPath = path.join(UPLOADS_DIR, `yt-${youtubeVideoId}.mp4`);
-  if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 50000) {
-    const cachedHeight = await probeVideoStreamHeight(cachedPath);
-    if (cachedHeight >= 720) {
-      onProgress?.(48, 'Loaded cached HD source video stream...');
+  if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 10000) {
+    const cachedDur = await probeVideoDuration(cachedPath);
+    if (cachedDur >= 1) {
+      onProgress?.(48, 'Loaded cached source video stream...');
       return cachedPath;
     }
   }
@@ -1557,20 +1529,189 @@ async function downloadYouTubeVideoMp4(
 
   const downloadPromise = (async (): Promise<string | null> => {
     const ytUrl = `https://www.youtube.com/watch?v=${youtubeVideoId}`;
-    const formatsToTry: ('mp4hd' | 'mp4')[] = ['mp4hd', 'mp4'];
 
-    const findFastestWeightMirror = async (
-      mirrors: string[],
-      fmt: 'mp4hd' | 'mp4'
-    ): Promise<{ mirror: string; token: string; nameMp4: string }> => {
-      const controllers = mirrors.map(() => new AbortController());
-      const timer = setTimeout(() => {
-        for (const c of controllers) c.abort();
-      }, 9500);
+    // Provider 1: Etacloud Fast Direct MP4 Converter (handles 240p..720p in ~4-6s)
+    const resolveViaEtacloud = async (
+      signal: AbortSignal
+    ): Promise<{ downloadUrl: string; referer: string }> => {
+      const apiKey =
+        'y2mate_39769a6e1fb94d02213ec0ee3a1e5807e8af00ac53d42fc7e075daafc22761e5';
+      const baseHeaders = {
+        'User-Agent': 'Mozilla/5.0',
+        Origin: 'https://y2mate.gs',
+        Referer: 'https://y2mate.gs/',
+      };
 
-      try {
-        const winner = await Promise.any(
-          mirrors.map(async (mirror, idx) => {
+      const authRes = await fetch(
+        `https://eta.etacloud.org/api/v1/auth?api_key=${apiKey}&_=${Date.now()}`,
+        {
+          headers: baseHeaders,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]),
+        }
+      );
+      if (!authRes.ok) throw new Error('etacloud auth failed');
+      const authData = (await authRes.json()) as { key?: string; error?: number };
+      if (!authData.key || (authData.error && authData.error > 0)) {
+        throw new Error('etacloud invalid key');
+      }
+
+      const authHeaders = {
+        ...baseHeaders,
+        Authorization: `Bearer ${authData.key}`,
+      };
+      const initRes = await fetch(
+        `https://eta.etacloud.org/api/v1/init?_=${Date.now()}`,
+        {
+          headers: authHeaders,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]),
+        }
+      );
+      if (!initRes.ok) throw new Error('etacloud init failed');
+      const initData = (await initRes.json()) as { convertURL?: string; error?: number };
+      if (!initData.convertURL || (initData.error && initData.error > 0)) {
+        throw new Error('etacloud missing convertURL');
+      }
+
+      let convRes = await fetch(
+        `${initData.convertURL}&v=${encodeURIComponent(youtubeVideoId)}&f=mp4&_=${Date.now()}`,
+        {
+          headers: authHeaders,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
+        }
+      );
+      if (!convRes.ok) throw new Error('etacloud convert failed');
+      let convData = (await convRes.json()) as {
+        error?: number;
+        redirect?: number;
+        redirectURL?: string;
+        progressURL?: string;
+        downloadURL?: string;
+      };
+
+      if (convData.redirect === 1 && convData.redirectURL) {
+        convRes = await fetch(`${convData.redirectURL}&_=${Date.now()}`, {
+          headers: authHeaders,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
+        });
+        if (!convRes.ok) throw new Error('etacloud redirect failed');
+        convData = await convRes.json();
+      }
+
+      if (convData.error && convData.error > 0) {
+        throw new Error(`etacloud convert error ${convData.error}`);
+      }
+      if (!convData.downloadURL) {
+        throw new Error('etacloud missing downloadURL');
+      }
+
+      if (convData.progressURL) {
+        for (let pollIdx = 0; pollIdx < 24; pollIdx++) {
+          if (signal.aborted) throw new Error('aborted');
+          await new Promise((r) => setTimeout(r, 1200));
+          if (signal.aborted) throw new Error('aborted');
+          const pRes = await fetch(`${convData.progressURL}&_=${Date.now()}`, {
+            headers: authHeaders,
+            signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]),
+          });
+          if (!pRes.ok) continue;
+          const pData = (await pRes.json()) as { progress?: number; error?: number };
+          if ((pData.error && pData.error > 0) || pData.progress === -1) {
+            throw new Error(`etacloud progress error ${pData.error}`);
+          }
+          onProgress?.(
+            Math.min(41, 26 + pollIdx * 2),
+            'Preparing high-definition MP4 stream for compilation...'
+          );
+          if (pData.progress === 3) {
+            return { downloadUrl: convData.downloadURL, referer: 'https://y2mate.gs/' };
+          }
+        }
+        throw new Error('etacloud poll timeout');
+      }
+
+      return { downloadUrl: convData.downloadURL, referer: 'https://y2mate.gs/' };
+    };
+
+    // Provider 2: Savenow / LBServer Streaming HD Engine (720p HD & 360p fallback)
+    const resolveViaSavenow = async (
+      fmt: '720' | '360',
+      signal: AbortSignal
+    ): Promise<{ downloadUrl: string; referer: string }> => {
+      const apikey = 'dfcb6d76f2f6a9894gjkege8a4ab232222';
+      const hosts = ['https://p.savenow.to', 'https://p.lbserver.xyz'];
+      const hdrs = {
+        'User-Agent': 'Mozilla/5.0',
+        Origin: 'https://en.loader.to',
+        Referer: 'https://en.loader.to/',
+      };
+
+      for (const host of hosts) {
+        if (signal.aborted) throw new Error('aborted');
+        try {
+          const initRes = await fetch(
+            `${host}/ajax/download.php?format=${fmt}&url=${encodeURIComponent(
+              ytUrl
+            )}&apikey=${apikey}`,
+            {
+              headers: hdrs,
+              signal: AbortSignal.any([signal, AbortSignal.timeout(9000)]),
+            }
+          );
+          if (!initRes.ok) continue;
+          const initData = (await initRes.json()) as {
+            success?: boolean;
+            id?: string;
+            progress_url?: string;
+          };
+          if (!initData.success || !initData.id) continue;
+
+          const pollUrl =
+            initData.progress_url || `${host}/api/progress?id=${encodeURIComponent(initData.id)}`;
+          for (let pollIdx = 0; pollIdx < 24; pollIdx++) {
+            if (signal.aborted) throw new Error('aborted');
+            await new Promise((r) => setTimeout(r, 1300));
+            if (signal.aborted) throw new Error('aborted');
+            const pRes = await fetch(pollUrl, {
+              headers: hdrs,
+              signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]),
+            });
+            if (!pRes.ok) continue;
+            const pData = (await pRes.json()) as {
+              progress?: number;
+              download_url?: string;
+              text?: string;
+            };
+            onProgress?.(
+              Math.min(42, 26 + pollIdx * 2),
+              `Preparing ${fmt}p source stream for compilation...`
+            );
+            if (pData.download_url && pData.download_url.startsWith('http')) {
+              return { downloadUrl: pData.download_url, referer: 'https://en.loader.to/' };
+            }
+            if (
+              pData.text &&
+              /error|failed|unavailable/i.test(pData.text) &&
+              !pData.download_url
+            ) {
+              break;
+            }
+          }
+        } catch {
+          // Try next host
+        }
+      }
+      throw new Error(`savenow ${fmt}p failed`);
+    };
+
+    // Provider 3: Gentle single-mirror Notube fallback (no parallel request flood)
+    const resolveViaNotubeGentle = async (): Promise<{
+      downloadUrl: string;
+      referer: string;
+    }> => {
+      const mirrors = pickNotubeMirrors(3);
+      for (const fmt of ['mp4hd', 'mp4'] as const) {
+        for (const mirror of mirrors) {
+          try {
             const weightRes = await fetch(`${mirror}/recover_weight.php`, {
               method: 'POST',
               headers: {
@@ -1580,126 +1721,149 @@ async function downloadYouTubeVideoMp4(
                 Referer: 'https://notube.net/',
               },
               body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&lang=en&subscribed=false`,
-              signal: controllers[idx].signal,
+              signal: AbortSignal.timeout(7000),
             });
-            if (!weightRes.ok) throw new Error(`weight failed on ${mirror}`);
+            if (!weightRes.ok) continue;
             const weightData = (await weightRes.json()) as {
               token?: string;
               name_mp4?: string;
             };
-            if (!weightData.token) throw new Error(`missing token on ${mirror}`);
-            return {
-              mirror,
-              token: weightData.token,
-              nameMp4: weightData.name_mp4 || '',
-            };
-          })
-        );
-        for (const c of controllers) c.abort();
-        return winner;
-      } finally {
-        clearTimeout(timer);
-      }
-    };
+            if (!weightData.token) continue;
 
-    const recoverAndResolveUrl = async (
-      mirror: string,
-      token: string,
-      nameMp4: string,
-      fmt: 'mp4hd' | 'mp4'
-    ): Promise<string> => {
-      const recoverRes = await fetch(`${mirror}/recover_file.php`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'Mozilla/5.0',
-          Origin: 'https://notube.net',
-          Referer: 'https://notube.net/',
-        },
-        body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&name_mp4=${encodeURIComponent(
-          nameMp4
-        )}&lang=en&token=${encodeURIComponent(
-          token
-        )}&subscribed=true&playlist=false&adblock=false`,
-        signal: AbortSignal.timeout(40000),
-      });
-      if (!recoverRes.ok) throw new Error(`recover_file failed on ${mirror}`);
-      const recoverText = await recoverRes.text();
-      if (recoverText.includes('cf-turnstile') || !recoverText.includes(token)) {
-        throw new Error(`turnstile or invalid token on ${mirror}`);
-      }
-
-      const dlPageRes = await fetch(
-        `https://notube.net/en/download?token=${encodeURIComponent(token)}`,
-        {
-          headers: {
-            'User-Agent': 'Mozilla/5.0',
-            Referer: 'https://notube.net/',
-          },
-          signal: AbortSignal.timeout(10000),
-        }
-      );
-      if (!dlPageRes.ok) throw new Error(`download page failed on ${mirror}`);
-
-      const dlHtml = await dlPageRes.text();
-      const dlMatch = dlHtml.match(
-        /https?:\/\/s\d+\.notube\.net\/download\.php\?token=[^"'\s>]+/i
-      );
-      if (!dlMatch || !dlMatch[0]) throw new Error(`no download url on ${mirror}`);
-
-      const downloadUrl = dlMatch[0].replace(/&amp;/g, '&');
-      if (/key=$/i.test(downloadUrl)) throw new Error(`empty key on ${mirror}`);
-      return downloadUrl;
-    };
-
-    for (const fmt of formatsToTry) {
-      const mirrors = pickNotubeMirrors(20);
-      const groups = [mirrors.slice(0, 10), mirrors.slice(10, 20)];
-      for (const group of groups) {
-        const tmpPath = path.join(
-          UPLOADS_DIR,
-          `yt-${youtubeVideoId}-${fmt}-${Date.now()}.tmp.mp4`
-        );
-        try {
-          onProgress?.(
-            24,
-            `Connecting to ${fmt === 'mp4hd' ? 'HD 720p/1080p' : 'MP4'} video stream...`
-          );
-          const { mirror, token, nameMp4 } = await findFastestWeightMirror(group, fmt);
-          onProgress?.(
-            34,
-            `Preparing ${fmt === 'mp4hd' ? 'HD' : 'MP4'} source stream for compilation...`
-          );
-          const downloadUrl = await recoverAndResolveUrl(mirror, token, nameMp4, fmt);
-          onProgress?.(44, 'Downloading source video & audio stream to compiler...');
-          await execFileAsync(
-            'curl',
-            ['-sL', '--max-time', '90', '-A', 'Mozilla/5.0', '-o', tmpPath, downloadUrl],
-            { timeout: 95000 }
-          );
-
-          if (fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 50000) {
-            const dur = await probeVideoDuration(tmpPath);
-            if (dur >= 5) {
-              fs.renameSync(tmpPath, cachedPath);
-              onProgress?.(54, 'Extracting 48kHz audio energy & speech pause boundaries...');
-              void extractRawAudioSignals(cachedPath);
-              return cachedPath;
+            const recoverRes = await fetch(`${mirror}/recover_file.php`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'User-Agent': 'Mozilla/5.0',
+                Origin: 'https://notube.net',
+                Referer: 'https://notube.net/',
+              },
+              body: `url=${encodeURIComponent(ytUrl)}&format=${fmt}&name_mp4=${encodeURIComponent(
+                weightData.name_mp4 || ''
+              )}&lang=en&token=${encodeURIComponent(
+                weightData.token
+              )}&subscribed=true&playlist=false&adblock=false`,
+              signal: AbortSignal.timeout(25000),
+            });
+            if (!recoverRes.ok) continue;
+            const recoverText = await recoverRes.text();
+            if (recoverText.includes('cf-turnstile') || !recoverText.includes(weightData.token)) {
+              continue;
             }
-          }
-        } catch {
-          // Try next group or format
-        } finally {
-          try {
-            if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+
+            const dlPageRes = await fetch(
+              `https://notube.net/en/download?token=${encodeURIComponent(weightData.token)}`,
+              {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0',
+                  Referer: 'https://notube.net/',
+                },
+                signal: AbortSignal.timeout(8000),
+              }
+            );
+            if (!dlPageRes.ok) continue;
+            const dlHtml = await dlPageRes.text();
+            const dlMatch = dlHtml.match(
+              /https?:\/\/s\d+\.notube\.net\/download\.php\?token=[^"'\s>]+/i
+            );
+            if (!dlMatch || !dlMatch[0]) continue;
+            const downloadUrl = dlMatch[0].replace(/&amp;/g, '&');
+            if (/key=$/i.test(downloadUrl)) continue;
+            return { downloadUrl, referer: 'https://notube.net/' };
           } catch {
-            // ignore
+            // Try next mirror
           }
         }
       }
+      throw new Error('notube gentle fallback failed');
+    };
+
+    const downloadStreamToCache = async (resolved: {
+      downloadUrl: string;
+      referer: string;
+    }): Promise<string | null> => {
+      const tmpPath = path.join(
+        UPLOADS_DIR,
+        `yt-${youtubeVideoId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.tmp.mp4`
+      );
+      try {
+        onProgress?.(44, 'Downloading source video & audio stream to compiler...');
+        await execFileAsync(
+          'curl',
+          [
+            '-sL',
+            '--max-time',
+            '90',
+            '-A',
+            'Mozilla/5.0',
+            '-e',
+            resolved.referer,
+            '-o',
+            tmpPath,
+            resolved.downloadUrl,
+          ],
+          { timeout: 95000 }
+        );
+        if (fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 10000) {
+          const dur = await probeVideoDuration(tmpPath);
+          if (dur >= 1) {
+            fs.renameSync(tmpPath, cachedPath);
+            onProgress?.(54, 'Extracting 48kHz audio energy & speech pause boundaries...');
+            void extractRawAudioSignals(cachedPath);
+            return cachedPath;
+          }
+        }
+      } catch {
+        // Ignore and allow next provider
+      } finally {
+        try {
+          if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+        } catch {
+          // ignore
+        }
+      }
+      return null;
+    };
+
+    onProgress?.(24, 'Connecting to HD 720p/1080p video stream...');
+
+    // Stage 1: Race Etacloud Fast MP4 and Savenow 720p HD concurrently
+    const raceCtrl1 = new AbortController();
+    const raceCtrl2 = new AbortController();
+    try {
+      const fastestResolved = await Promise.any([
+        resolveViaEtacloud(raceCtrl1.signal),
+        resolveViaSavenow('720', raceCtrl2.signal),
+      ]);
+      raceCtrl1.abort();
+      raceCtrl2.abort();
+      const saved = await downloadStreamToCache(fastestResolved);
+      if (saved) return saved;
+    } catch {
+      raceCtrl1.abort();
+      raceCtrl2.abort();
     }
 
-    if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 50000) {
+    // Stage 2: Savenow 360p fallback
+    const fallbackCtrl = new AbortController();
+    try {
+      const resolved360 = await resolveViaSavenow('360', fallbackCtrl.signal);
+      const saved = await downloadStreamToCache(resolved360);
+      if (saved) return saved;
+    } catch {
+      fallbackCtrl.abort();
+    }
+
+    // Stage 3: Gentle single-mirror Notube fallback
+    try {
+      const resolvedNotube = await resolveViaNotubeGentle();
+      const saved = await downloadStreamToCache(resolvedNotube);
+      if (saved) return saved;
+    } catch {
+      // All providers exhausted
+    }
+
+    if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 10000) {
       return cachedPath;
     }
     return null;
@@ -1741,12 +1905,12 @@ async function renderHighlightReelWithFfmpeg(
     video.duration > 0 ? sourceDuration / Math.max(1, video.duration) : 1;
 
   const jobKeepPct = clampKeepPercentage(job.keep_percentage);
-  if (!video.is_fixture && sourceDuration >= 5) {
-    if (Math.abs(sourceDuration - video.duration) > 10) {
+  if (!video.is_fixture && sourceDuration >= 1) {
+    if (Math.abs(sourceDuration - video.duration) > 5) {
       for (const seg of segments) {
         const scaledStart = Math.max(0, seg.start_time * durationRatio);
-        const scaledLen = Math.max(1, (seg.end_time - seg.start_time) * durationRatio);
-        seg.start_time = Math.min(Math.max(0, sourceDuration - 1), scaledStart);
+        const scaledLen = Math.max(0.5, (seg.end_time - seg.start_time) * durationRatio);
+        seg.start_time = Math.min(Math.max(0, sourceDuration - 0.5), scaledStart);
         seg.end_time = Math.min(sourceDuration, seg.start_time + scaledLen);
       }
     } else if (segments.length > 0 && segments[segments.length - 1].role === 'outro') {
@@ -1763,7 +1927,7 @@ async function renderHighlightReelWithFfmpeg(
 
   const ordered = [...segments].sort((a, b) => a.sequence_order - b.sequence_order);
   const totalPlannedDuration = Math.max(
-    5,
+    0.5,
     ordered.reduce((acc, seg) => acc + Math.max(0.5, seg.end_time - seg.start_time), 0)
   );
 
@@ -1776,7 +1940,7 @@ async function renderHighlightReelWithFfmpeg(
   if (
     cachedRender &&
     fs.existsSync(cachedRender.outputPath) &&
-    (await probeVideoStreamHeight(cachedRender.outputPath)) >= resSpec.height
+    fs.statSync(cachedRender.outputPath).size > 10000
   ) {
     if (cachedRender.outputPath !== finalOutputPath) {
       fs.copyFileSync(cachedRender.outputPath, finalOutputPath);
@@ -2034,16 +2198,10 @@ async function runHighlightPipeline(jobId: string, channelAccessToken?: string):
         'Fetching HD video stream and analyzing acoustic & semantic highlights...'
       );
 
-      const geminiRawTask =
-        fixture || !video.original_url.startsWith('http') || video.duration > 600
-          ? Promise.resolve(null)
-          : fetchGeminiRawCandidates(video, activeKeepPct);
-
       const engagementTask = fetchEngagementData(video.youtube_video_id, channelAccessToken);
 
-      const [mediaSignals, geminiRaw, engagement] = await Promise.all([
+      const [mediaSignals, engagement] = await Promise.all([
         mediaAndSignalsTask,
-        geminiRawTask,
         engagementTask,
       ]);
 
@@ -2059,8 +2217,7 @@ async function runHighlightPipeline(jobId: string, channelAccessToken?: string):
       const geminiResult = await analyzeVideoWithGemini(
         video,
         mediaSignals,
-        activeKeepPct,
-        geminiRaw
+        activeKeepPct
       );
 
       progressCeiling = 76;
@@ -2299,7 +2456,8 @@ async function backfillMissingCompiledVideos(): Promise<void> {
       modified = true;
       continue;
     }
-    if (job.status !== 'complete' && job.status !== 'failed') {
+    if (job.status !== 'complete') {
+      job.error = undefined;
       void runHighlightPipeline(job.id);
     } else if (
       job.status === 'complete' &&
@@ -2321,8 +2479,6 @@ async function startServer() {
 
   ensureFixtureSourceVideo().catch(() => {});
   backfillMissingCompiledVideos().catch(() => {});
-  void downloadYouTubeVideoMp4('M7lc1UVf-VE').catch(() => {});
-  void downloadYouTubeVideoMp4('_OXtStBZyqs').catch(() => {});
 
   app.get('/api/system/status', (_req, res) => {
     const geminiConfigured = hasValidEnvKey(process.env.GEMINI_API_KEY, 'MY_GEMINI_API_KEY');
@@ -2612,19 +2768,13 @@ async function startServer() {
     const video = db.videos[job.video_id];
     const segments = db.segments[job.id] || [];
 
-    const existingRenderHeight =
-      job.download_location && fs.existsSync(job.download_location)
-        ? await probeVideoStreamHeight(job.download_location)
-        : 0;
-
     if (
       job.status === 'complete' &&
       segments.length > 0 &&
       video &&
       (job.source_media_status !== 'rendered' ||
         !job.download_location ||
-        !fs.existsSync(job.download_location) ||
-        (existingRenderHeight > 0 && existingRenderHeight < 720))
+        !fs.existsSync(job.download_location))
     ) {
       try {
         if (!job.source_media_path || !fs.existsSync(job.source_media_path)) {

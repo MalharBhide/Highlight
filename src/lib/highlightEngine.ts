@@ -1407,6 +1407,21 @@ export function selectHighlightReel(
     }
   }
 
+  // Fallback guarantee for ultra-short videos so at least one clip is always compiled
+  if (selected.length === 0 && candidates.length > 0) {
+    const best = [...candidates].sort((a, b) => b.combined_score - a.combined_score)[0];
+    const clipLen = Math.min(videoDuration, Math.max(0.5, targetSeconds));
+    const s = Math.max(0, Math.min(videoDuration - clipLen, best.start_time));
+    const e = Math.min(videoDuration, s + clipLen);
+    selected.push({
+      ...best,
+      start_time: s,
+      end_time: e,
+      duration: e - s,
+      role: classifySegmentRole({ ...best, start_time: s, end_time: e }, videoDuration),
+    });
+  }
+
   return selected.map((clip, idx) => ({
     start_time: clip.start_time,
     end_time: clip.end_time,
