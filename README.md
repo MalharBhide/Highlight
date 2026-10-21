@@ -40,32 +40,39 @@ Deploy the `main` branch, which contains the repaired application and deployment
 | `GEMINI_API_KEY` | Required for real AI analysis; keep it on the server. Get it from [Google AI Studio](https://aistudio.google.com/apikey). |
 | `GEMINI_MODEL` | Video-capable model available to your account; defaults to `gemini-3.8-flash`. |
 | `YOUTUBE_API_KEY` | Optional YouTube Data API v3 key for richer metadata and duration. |
-| `STORAGE_DIR` | Database, caches, uploads, and renders; defaults to an OS temporary directory. Set a persistent directory when hosting. |
+| `STORAGE_DIR` | Database, caches, uploads, and renders; temporary on Render Free. Set a local directory to retain files on your computer. |
 | `MEDIA_STORAGE_DIR` | Optional separate media directory; otherwise follows `STORAGE_DIR`. Both locations must persist if separated. |
 | `FFMPEG_PATH`, `FFPROBE_PATH` | Optional executable overrides. Docker uses `/usr/bin/ffmpeg` and `/usr/bin/ffprobe`. |
 | `YT_DLP_BIN` | Optional yt-dlp executable path. |
 | `ALLOW_HEURISTIC_FALLBACK` | `false` by default. Set `true` to allow clearly labeled audio/timing selections if Gemini is unavailable. This mode does not understand the video's meaning. |
 | `ENABLE_DEV_FIXTURES` | `false` by default in production; development fixture IDs are disabled unless enabled explicitly. |
+| `FREE_DEMO_MODE` | Enables the limited resource profile used by Render Free. Defaults to `false` locally. |
 | `PORT` | HTTP port, defaults to 3000. |
 
-Supported uploads: MP4, MOV, WebM, MKV, and M4V, up to 500 MB, between 10 seconds and four hours. YouTube downloads are limited to 500 MB and four hours. Local uploads are retained to support retries and changing the percentage; deleting a reel removes its private upload and output.
+Supported formats: MP4, MOV, WebM, MKV, and M4V. Local/full mode permits up to 500 MB and four hours (minimum 10 seconds). Render Free demo mode permits up to 50 MB and five minutes, with source resolution up to 1080p. Local uploads are retained to support retries and changing the percentage; deleting a reel removes its private upload and output.
 
 The browser stores a random capability token locally. Job APIs require this token, and video playback includes it in the media URL. This provides a browser-specific library, not an account login or cross-device synchronization. Clearing browser storage loses access to the library.
 
-## Host on Render
+## Host for $0 on Render Free
 
-Use a **Docker Web Service with a persistent disk**. The included `render.yaml` defines one paid `1c-2g` instance (1 CPU, 2 GB RAM) and a 20 GB disk. Review Render's current cost before creating it. Video rendering needs CPU, memory, and persistent disk; a static website host alone cannot run this application.
+The included `render.yaml` now uses **Render Free**, with no paid instance and no persistent disk. This is a small public demo, not an always-on production service. `FREE_DEMO_MODE=true` limits inputs to **5 minutes, 50 MB, and 1080p**, renders at **up to 480p** with one FFmpeg thread, and accepts one processing job at a time. Running locally with the flag disabled keeps the full limits and HD output.
 
-1. Commit and push the repaired code, including `Dockerfile`, `package-lock.json`, and `render.yaml`, to your GitHub repository.
-2. In Render, choose **New → Blueprint**, connect the repository, and select `main`. Render reads `render.yaml`.
-3. Enter your `GEMINI_API_KEY`. Supply `YOUTUBE_API_KEY` if you have one; otherwise leave it blank. If needed, change `GEMINI_MODEL` to a video-capable model your Google account can access.
-4. Review the paid service and disk configuration, then deploy. The Docker image installs Node, FFmpeg, FFprobe, Python, and yt-dlp automatically.
-5. Open the generated `https://…onrender.com` URL. `/healthz` should return `{"status":"ok"}`. Test a short video upload, wait for completion, play it, and download the MP4. Then test a YouTube URL.
-6. To use your own domain, add it in the service's Custom Domains settings and follow Render's DNS instructions.
+1. Open [Render](https://dashboard.render.com/) and connect your GitHub account.
+2. Choose **New → Blueprint**, select `MalharBhide/Highlight`, choose **`main`**, and leave the Blueprint path as `render.yaml`.
+3. Confirm that the service plan says **Free** and no disk or paid resource is listed. Keep the free `onrender.com` address rather than buying a domain.
+4. Enter a `GEMINI_API_KEY` from a **Gemini API free-tier project** in [Google AI Studio](https://aistudio.google.com/apikey). Keep Google Cloud billing disabled to stay within a $0 budget. The configured `gemini-3.8-flash` supports free-tier input/output, subject to account availability and rate limits. Do not enable paid billing to bypass a quota error. `YOUTUBE_API_KEY` is optional; leave it blank if you do not have one.
+5. Click **Deploy Blueprint**. Docker installs the runtime and media tools automatically. No separate frontend deployment is needed.
+6. Open your generated `https://…onrender.com` URL. Check `/healthz`, upload a short video, and test playback and MP4 download. Start with a 20–60 second upload; the free CPU is slow. Then try a short YouTube link.
 
-If configuring the service manually instead of using a Blueprint, select **Docker**, use the repository root, leave Docker Command empty, set the health check to `/healthz`, and attach a disk at `/app/storage`. Set `STORAGE_DIR=/app/storage`, `GEMINI_API_KEY`, and optionally `YOUTUBE_API_KEY` / `GEMINI_MODEL`.
+For manual setup, choose **New → Web Service → Docker**, branch `main`, plan **Free**, health check `/healthz`, and no disk. Set `FREE_DEMO_MODE=true`, `STORAGE_DIR=/app/storage`, `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.8-flash`, and `ALLOW_HEURISTIC_FALLBACK=false`. Leave Docker Command empty.
 
-Render's [Docker documentation](https://render.com/docs/docker), [web service guide](https://render.com/docs/web-services), and [disk documentation](https://render.com/docs/disks) describe these settings. A disk requires a paid service; the default filesystem is ephemeral. Keep **one instance and one Node process** because the current application uses an in-memory job queue and a local JSON database. Move to a shared database, durable queue, and object storage before scaling to multiple instances. Back up `/app/storage` and monitor its available space.
+**Free hosting limits:** Render sleeps after 15 minutes without traffic. Waking it takes about a minute, and local files are lost on sleep, restart, or redeploy. Download each reel immediately; the library is temporary. The banner in the app explains this. Free accounts also have monthly runtime/build/bandwidth limits. Keep Render on its free plan, do not add a payment method for overages, and let the service suspend when the allowance runs out. Render may require account verification; if it requires a payment method you do not want to provide, use the local option below. See [Render's free-tier documentation](https://render.com/docs/free) and [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing).
+
+This configuration requests no paid hosting resources, but cannot prevent API charges if you supply a key from a billing-enabled Google project. Render and Google quota eligibility are separate. Video downloading may also be blocked from hosting-provider IPs; uploads avoid that dependency. A small free server cannot guarantee successful processing of every video within its input limits.
+
+**For longer videos at $0:** run `npm run dev` on your own computer and use the same free-tier Gemini key. Your computer handles FFmpeg, and a local storage directory retains your files. This is accessible locally while the server runs, rather than a publicly hosted site. A free static-only host cannot execute this application's Node/FFmpeg backend.
+
+Keep one instance and one Node process. A paid server is not required to try the app, and the repository no longer requests one by default.
 
 ## Run the same container elsewhere
 
@@ -101,3 +108,11 @@ npm run test:docker
 This test starts an isolated non-root container with a temporary persistent volume, checks the homepage and built assets, verifies FFmpeg/FFprobe and yt-dlp, compiles a real video, downloads it, and confirms the reel remains available after a restart. It removes its test container and volume afterwards.
 
 The API integration suite also exercises every supported percentage from 5% through 50%, source replacement, changing a reel's percentage, retries, explicit rendering, persistence, and missing-key failures. GitHub Actions runs the production build and both test suites on each push.
+
+To exercise the free demo's memory/CPU profile in Docker:
+
+```bash
+HIGHLIGHT_TEST_FREE_DEMO=true npm run test:docker
+```
+
+This runs the container with 512 MB RAM and 0.1 CPU, matching the published free compute limits. It verifies a short test video; it does not establish capacity for every video or traffic level.

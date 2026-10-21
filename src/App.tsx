@@ -40,6 +40,8 @@ export default function App() {
   const [activeVideo, setActiveVideo] = useState<VideoRecord | null>(null);
   const [activeSegments, setActiveSegments] = useState<HighlightSegmentRecord[]>([]);
 
+  const [freeDemoMode, setFreeDemoMode] = useState(false);
+
   const [recentJobs, setRecentJobs] = useState<RecentJobSummary[]>([]);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -113,6 +115,9 @@ export default function App() {
   );
 
   useEffect(() => {
+    void fetch('/api/system/status').then((response) => response.json()).then((status) => {
+      setFreeDemoMode(status.freeDemoMode === true);
+    }).catch(() => {});
     void fetchRecentJobs();
   }, [fetchRecentJobs]);
 
@@ -339,6 +344,11 @@ export default function App() {
       />
 
       <main>
+        {freeDemoMode && (
+          <p role="status" className="px-6 py-3 text-center text-sm border-b">
+            Free demo: videos up to 5 minutes and 50 MB, with 480p output. Download your reel now; saved videos disappear when the server sleeps or restarts.
+          </p>
+        )}
         {screen === 'home' && (
           <>
             <HeroWorkspace

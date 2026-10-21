@@ -22,3 +22,6 @@ jobs:
           FFPROBE_PATH: /usr/bin/ffprobe
       - run: docker build -t highlight:test .
       - run: npm run test:docker
+      - run: npm run test:docker
+        env:
+          HIGHLIGHT_TEST_FREE_DEMO: "true"

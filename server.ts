@@ -42,6 +42,20 @@ import { DEVELOPMENT_FIXTURES, KEYNOTE_THUMBNAIL_SVG } from './src/lib/testFixtu
 dotenv.config();
 
 const execFileAsync = promisify(execFile);
+const FREE_DEMO_MODE = process.env.FREE_DEMO_MODE === 'true';
+const MAX_SOURCE_MB = FREE_DEMO_MODE ? 50 : 500;
+const MAX_SOURCE_SECONDS = FREE_DEMO_MODE ? 300 : 14400;
+const RENDER_THREADS = FREE_DEMO_MODE ? '1' : '4';
+
+function validateSourceLimits(info: { duration: number; width: number; height: number }): void {
+  if (info.duration < 10 || info.duration > MAX_SOURCE_SECONDS) {
+    throw new Error(`Please use a video between 10 seconds and ${MAX_SOURCE_SECONDS / 60} minutes long.`);
+  }
+  if (FREE_DEMO_MODE && (Math.max(info.width, info.height) > 1920 || Math.min(info.width, info.height) > 1080)) {
+    throw new Error('The free demo accepts source videos up to 1080p. Please use a smaller video or run Highlight locally.');
+  }
+}
+
 const nodeRequire = createRequire(import.meta.url);
 
 function resolveStaticBinary(pkgName: string): string | null {
@@ -1464,16 +1478,16 @@ async function downloadYouTubeVideoMp4(
       await execFileAsync(process.env.YT_DLP_BIN || 'yt-dlp', [
         '--ignore-config', '--no-playlist', '--no-progress', '--no-warnings',
         '--js-runtimes', `node:${process.execPath}`, '--socket-timeout', '20', '--retries', '2',
-        '--max-filesize', '500M', '--match-filters', '!is_live & duration <= 14400',
+        '--max-filesize', `${MAX_SOURCE_MB}M`, '--match-filters', `!is_live & duration <= ${MAX_SOURCE_SECONDS}`,
         '--ffmpeg-location', FFMPEG_BIN,
-        '-f', 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+        '-f', FREE_DEMO_MODE ? 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[height<=720]' : 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
         '--merge-output-format', 'mp4', '--remux-video', 'mp4',
         '-o', path.join(tempDir, 'source.%(ext)s'),
         '--', `https://www.youtube.com/watch?v=${youtubeVideoId}`,
       ], { timeout: 300000, maxBuffer: 4 * 1024 * 1024 });
       const downloaded = path.join(tempDir, 'source.mp4');
-      if (fs.statSync(downloaded).size > 500 * 1024 * 1024) throw new Error('Source video exceeds 500 MB.');
-      await probeVideoDuration(downloaded);
+      if (fs.statSync(downloaded).size > MAX_SOURCE_MB * 1024 * 1024) throw new Error(`Source video exceeds ${MAX_SOURCE_MB} MB.`);
+      validateSourceLimits(await probeMediaInfo(downloaded));
       fs.renameSync(downloaded, cachedPath);
       return cachedPath;
     } catch (error) {
@@ -1537,7 +1551,9 @@ async function renderHighlightReelWithFfmpeg(
   }
 
   const ordered = [...segments].sort((a, b) => a.sequence_order - b.sequence_order);
-  const resSpec = selectTargetOutputResolution(sourceInfo.width, sourceInfo.height);
+  const resSpec = FREE_DEMO_MODE
+    ? { width: 854, height: 480, targetMaxBitrateKbps: 1500 }
+    : selectTargetOutputResolution(sourceInfo.width, sourceInfo.height);
   const finalFilename = `highlight-${video.youtube_video_id}-${job.id}.mp4`;
   const finalOutputPath = path.join(RENDERS_DIR, finalFilename);
 
@@ -1597,6 +1613,8 @@ async function renderHighlightReelWithFfmpeg(
           safeStart.toFixed(3),
           '-t',
           safeDuration.toFixed(3),
+          '-threads',
+          RENDER_THREADS,
           '-i',
           job.source_media_path
         );
@@ -1627,7 +1645,7 @@ async function renderHighlightReelWithFfmpeg(
 
       ffmpegArgs.push(
         '-filter_complex_threads',
-        '4',
+        RENDER_THREADS,
         '-filter_complex',
         filterParts.join(';'),
         '-map',
@@ -1635,7 +1653,7 @@ async function renderHighlightReelWithFfmpeg(
         '-map',
         '[outa]',
         '-threads',
-        '4',
+        RENDER_THREADS,
         '-c:v',
         'libx264',
         '-preset',
@@ -1827,6 +1845,8 @@ async function runHighlightPipelineInternal(
         );
       }
 
+      if (!fixture) validateSourceLimits(await probeMediaInfo(job.source_media_path));
+
       // Source acquisition verified -> Advance to Phase 2 (28%..58%)
       progressCeiling = 58;
       updateJobStage(
@@ -1950,7 +1970,7 @@ async function runHighlightPipelineInternal(
         'rendering_video',
         7,
         90,
-        'Cutting and stitching HD H.264 video clips and 48kHz stereo audio with FFmpeg...',
+        'Cutting and stitching video clips and stereo audio into an MP4...',
         { source_media_status: 'rendering' }
       );
 
@@ -1965,7 +1985,7 @@ async function runHighlightPipelineInternal(
         'complete',
         8,
         100,
-        'Highlight video compiled in HD and ready to watch.',
+        'Highlight video compiled and ready to watch.',
         {
           source_media_status: 'rendered',
           download_location: outputPath,
@@ -1992,7 +2012,7 @@ const upload = multer({
     },
   }),
   limits: {
-    fileSize: 500 * 1024 * 1024,
+    fileSize: MAX_SOURCE_MB * 1024 * 1024,
   },
   fileFilter: (_req, file, cb) => {
     if (
@@ -2105,7 +2125,7 @@ async function startServer() {
     next();
   });
   app.use('/api/highlights', (req, res, next) => {
-    if (req.method === 'POST' && activeJobPipelines.size >= 10) {
+    if (req.method === 'POST' && activeJobPipelines.size >= (FREE_DEMO_MODE ? 1 : 10)) {
       res.status(429).json({ error: 'The processing queue is full. Please try again later.' });
       return;
     }
@@ -2123,6 +2143,9 @@ async function startServer() {
       youtubeDataApiConfigured,
       ffmpegAvailable,
       ffprobeAvailable,
+      freeDemoMode: FREE_DEMO_MODE,
+      maxUploadMB: MAX_SOURCE_MB,
+      maxDurationSeconds: MAX_SOURCE_SECONDS,
     });
   });
 
@@ -2221,7 +2244,7 @@ async function startServer() {
         }
 
         const actualDuration = await probeVideoDuration(req.file.path);
-        if (actualDuration < 10 || actualDuration > 14400) throw new Error('Please upload a video between 10 seconds and 4 hours long.');
+        validateSourceLimits(await probeMediaInfo(req.file.path));
         const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
         const keepPct = clampKeepPercentage(
           req.body?.keepPercentage !== undefined ? Number(req.body.keepPercentage) : undefined
@@ -2488,6 +2511,7 @@ async function startServer() {
         }
 
         const actualDuration = await probeVideoDuration(uploadedFilePath);
+        validateSourceLimits(await probeMediaInfo(uploadedFilePath));
         const strictDurationCheck =
           req.body?.syncDuration === 'false' || req.body?.syncDuration === false;
 
