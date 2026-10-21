@@ -8,8 +8,19 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const require = createRequire(import.meta.url);
-const ffmpeg = process.env.FFMPEG_PATH || require('ffmpeg-static');
-const ffprobe = process.env.FFPROBE_PATH || require('ffprobe-static').path;
+function resolveTestBin(envPath: string | undefined, pkgName: string, systemBin: string): string {
+  if (envPath) return envPath;
+  try {
+    const loaded = require(pkgName);
+    const candidate = typeof loaded === 'string' ? loaded : loaded?.path;
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  } catch {
+    // fallback to system binary
+  }
+  return fs.existsSync(`/usr/bin/${systemBin}`) ? `/usr/bin/${systemBin}` : systemBin;
+}
+const ffmpeg = resolveTestBin(process.env.FFMPEG_PATH, 'ffmpeg-static', 'ffmpeg');
+const ffprobe = resolveTestBin(process.env.FFPROBE_PATH, 'ffprobe-static', 'ffprobe');
 const owner = 'hc-test-owner-12345678';
 const stranger = 'hc-test-stranger-12345678';
 

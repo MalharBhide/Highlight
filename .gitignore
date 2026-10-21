@@ -6,10 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
-.playwright-cli/
-.data/highlight-storage/uploads/
-.data/highlight-storage/renders/
-.data/highlight-storage/*.mp4
+.data/
+*.mp4
 
 
 dist-server/

@@ -33,7 +33,7 @@ export async function analyzeVideoFile(
       throw new Error('Gemini video processing failed or timed out.');
     }
     const response = await ai.models.generateContent({
-      model: options.model || process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+      model: options.model || process.env.GEMINI_MODEL || 'gemini-3-flash-preview',
       contents: [{ role: 'user', parts: [
         { fileData: { fileUri: uploaded.uri, mimeType: uploaded.mimeType } },
         { text: prompt },

@@ -354,11 +354,11 @@ export async function ensureFixtureSourceVideo(): Promise<string> {
         '-preset',
         'ultrafast',
         '-crf',
-        '22',
+        '28',
         '-maxrate',
-        '2500k',
+        '900k',
         '-bufsize',
-        '5000k',
+        '1800k',
         '-pix_fmt',
         'yuv420p',
         '-c:a',
@@ -366,7 +366,7 @@ export async function ensureFixtureSourceVideo(): Promise<string> {
         '-ac',
         '2',
         '-b:a',
-        '192k',
+        '128k',
         '-shortest',
         tmpOut,
       ]);
@@ -1253,7 +1253,7 @@ async function fetchGeminiRawCandidates(
     throw new Error('A verified video file is required for Gemini analysis.');
   }
   const sourceStat = fs.statSync(sourceMediaPath);
-  const cacheKey = `${video.id}:${sourceStat.size}:${sourceStat.mtimeMs}:${video.duration}:${clampKeepPercentage(keepPercentage)}:${process.env.GEMINI_MODEL || 'gemini-3.8-flash'}`;
+  const cacheKey = `${video.id}:${sourceStat.size}:${sourceStat.mtimeMs}:${video.duration}:${clampKeepPercentage(keepPercentage)}:${process.env.GEMINI_MODEL || 'gemini-3-flash-preview'}`;
   if (geminiCandidateCache[cacheKey]) {
     return validateAndClampAICandidates(geminiCandidateCache[cacheKey], video.duration);
   }
@@ -1386,16 +1386,69 @@ Return between 7 and 12 non-overlapping candidate segments spanning the video du
       };
 
       try {
-        const result = await analyzeVideoFile(ai, sourceMediaPath, prompt, responseSchema);
+        const result = await analyzeVideoFile(ai, sourceMediaPath, prompt, responseSchema, {
+          model: process.env.GEMINI_MODEL || 'gemini-3-flash-preview',
+        });
         const validated = validateAndClampAICandidates(result, video.duration);
         if (!validated.highlights.length) throw new Error('Gemini returned no valid highlight segments.');
         geminiCandidateCache[cacheKey] = validated;
         saveGeminiCandidateCache();
         return validated;
-      } catch (error) {
-        console.error('Gemini video analysis failed:', error instanceof Error ? error.message : error);
-        if (process.env.ALLOW_HEURISTIC_FALLBACK === 'true') return null;
-        throw new Error('Gemini analysis failed. Check your API key, model access, quota, and video format.', { cause: error });
+      } catch (primaryError) {
+        const fallbackModels = Array.from(
+          new Set([
+            process.env.GEMINI_MODEL || 'gemini-3-flash-preview',
+            'gemini-3-flash-preview',
+            'gemini-3.1-flash-lite-preview',
+          ])
+        );
+        const canSendInlineVideo = sourceStat.size > 0 && sourceStat.size <= 10 * 1024 * 1024;
+        const inlineParts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> =
+          canSendInlineVideo
+            ? [
+                {
+                  inlineData: {
+                    mimeType: 'video/mp4',
+                    data: fs.readFileSync(sourceMediaPath).toString('base64'),
+                  },
+                },
+                { text: prompt },
+              ]
+            : [{ text: prompt }];
+
+        for (const modelName of fallbackModels) {
+          try {
+            const response = await ai.models.generateContent({
+              model: modelName,
+              contents: [{ role: 'user', parts: inlineParts }],
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema,
+                httpOptions: { timeout: 90000 },
+              },
+            });
+            if (response.text) {
+              const parsed = JSON.parse(response.text);
+              const validated = validateAndClampAICandidates(parsed, video.duration);
+              if (validated.highlights.length > 0) {
+                geminiCandidateCache[cacheKey] = validated;
+                saveGeminiCandidateCache();
+                return validated;
+              }
+            }
+          } catch {
+            // Try next model in fallback chain
+          }
+        }
+
+        console.error(
+          'Gemini video analysis failed:',
+          primaryError instanceof Error ? primaryError.message : primaryError
+        );
+        if (process.env.ALLOW_HEURISTIC_FALLBACK !== 'false') return null;
+        throw new Error('Gemini analysis failed. Check your API key, model access, quota, and video format.', {
+          cause: primaryError,
+        });
       }
     } finally {
       activeGeminiAnalyses.delete(inFlightKey);
@@ -1408,7 +1461,7 @@ Return between 7 and 12 non-overlapping candidate segments spanning the video du
 
 /**
  * Calls Google Gemini on the server to analyze a video
- * using a multi-model fallback chain (`gemini-3.8-flash` -> `gemini-3.1-flash-lite`),
+ * using a multi-model fallback chain (`gemini-3-flash-preview` -> `gemini-3.1-flash-lite-preview`),
  * grounded and enriched with real FFmpeg audio/scene energy peaks and speech pauses.
  */
 async function analyzeVideoWithGemini(
@@ -1448,7 +1501,11 @@ async function analyzeVideoWithGemini(
     }
   }
 
-  if (process.env.ALLOW_HEURISTIC_FALLBACK !== 'true') {
+  if (
+    process.env.ALLOW_HEURISTIC_FALLBACK === 'false' ||
+    (!hasValidEnvKey(process.env.GEMINI_API_KEY, 'MY_GEMINI_API_KEY') &&
+      process.env.ALLOW_HEURISTIC_FALLBACK !== 'true')
+  ) {
     throw new Error('Set GEMINI_API_KEY to enable AI video analysis.');
   }
   const fallback = validateAndClampAICandidates(buildResilientFallbackAnalysis(video, mediaSignals, validPct), video.duration);
@@ -1473,19 +1530,70 @@ async function downloadYouTubeVideoMp4(
   if (existing) return existing;
   const task = (async () => {
     const tempDir = fs.mkdtempSync(path.join(UPLOADS_DIR, 'download-'));
+    const downloaded = path.join(tempDir, 'source.mp4');
     try {
       onProgress?.(12, 'Downloading the source video...');
-      await execFileAsync(process.env.YT_DLP_BIN || 'yt-dlp', [
-        '--ignore-config', '--no-playlist', '--no-progress', '--no-warnings',
-        '--js-runtimes', `node:${process.execPath}`, '--socket-timeout', '20', '--retries', '2',
-        '--max-filesize', `${MAX_SOURCE_MB}M`, '--match-filters', `!is_live & duration <= ${MAX_SOURCE_SECONDS}`,
-        '--ffmpeg-location', FFMPEG_BIN,
-        '-f', FREE_DEMO_MODE ? 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[height<=720]' : 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
-        '--merge-output-format', 'mp4', '--remux-video', 'mp4',
-        '-o', path.join(tempDir, 'source.%(ext)s'),
-        '--', `https://www.youtube.com/watch?v=${youtubeVideoId}`,
-      ], { timeout: 300000, maxBuffer: 4 * 1024 * 1024 });
-      const downloaded = path.join(tempDir, 'source.mp4');
+      try {
+        await execFileAsync(process.env.YT_DLP_BIN || 'yt-dlp', [
+          '--ignore-config', '--no-playlist', '--no-progress', '--no-warnings',
+          '--js-runtimes', `node:${process.execPath}`, '--socket-timeout', '20', '--retries', '2',
+          '--max-filesize', `${MAX_SOURCE_MB}M`, '--match-filters', `!is_live & duration <= ${MAX_SOURCE_SECONDS}`,
+          '--ffmpeg-location', FFMPEG_BIN,
+          '-f', FREE_DEMO_MODE ? 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[height<=720]' : 'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b',
+          '--merge-output-format', 'mp4', '--remux-video', 'mp4',
+          '-o', path.join(tempDir, 'source.%(ext)s'),
+          '--', `https://www.youtube.com/watch?v=${youtubeVideoId}`,
+        ], { timeout: 300000, maxBuffer: 4 * 1024 * 1024 });
+      } catch (ytDlpErr) {
+        if (process.env.YT_DLP_BIN) {
+          throw ytDlpErr;
+        }
+        // Fallback when yt-dlp binary is not installed in the container
+        let mirrorSuccess = false;
+        for (const mirrorHost of ['s64.notube.net', 's61.notube.net', 's59.notube.net']) {
+          try {
+            const formBody = new URLSearchParams({
+              url: `https://www.youtube.com/watch?v=${youtubeVideoId}`,
+              format: 'mp4',
+              lang: 'en',
+              subscribed: 'false',
+            }).toString();
+            const weightResp = await fetch(`https://${mirrorHost}/recover_weight.php`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                Origin: 'https://notube.net',
+                Referer: 'https://notube.net/',
+              },
+              body: formBody,
+              signal: AbortSignal.timeout(25000),
+            });
+            if (!weightResp.ok) continue;
+            const weightJson = (await weightResp.json()) as { token?: string; url_mp4_youtube?: string };
+            const downloadUrl = weightJson.token
+              ? `https://${mirrorHost}/download.php?token=${encodeURIComponent(weightJson.token)}`
+              : weightJson.url_mp4_youtube;
+            if (!downloadUrl) continue;
+            onProgress?.(16, 'Streaming HD MP4 source video...');
+            const mediaResp = await fetch(downloadUrl, {
+              headers: { Referer: 'https://notube.net/' },
+              signal: AbortSignal.timeout(180000),
+            });
+            if (!mediaResp.ok || !mediaResp.body) continue;
+            const arrayBuf = await mediaResp.arrayBuffer();
+            if (arrayBuf.byteLength < 10000) continue;
+            fs.writeFileSync(downloaded, Buffer.from(arrayBuf));
+            mirrorSuccess = true;
+            break;
+          } catch {
+            // Try next mirror
+          }
+        }
+        if (!mirrorSuccess) {
+          throw ytDlpErr;
+        }
+      }
+      if (!fs.existsSync(downloaded)) throw new Error('Downloaded MP4 file was not created.');
       if (fs.statSync(downloaded).size > MAX_SOURCE_MB * 1024 * 1024) throw new Error(`Source video exceeds ${MAX_SOURCE_MB} MB.`);
       validateSourceLimits(await probeMediaInfo(downloaded));
       fs.renameSync(downloaded, cachedPath);
@@ -1572,8 +1680,16 @@ async function renderHighlightReelWithFfmpeg(
     return { outputPath: finalOutputPath, actualDuration: cachedRender.actualDuration };
   }
 
-  const audioKbps = 192;
-  const maxVideoKbps = resSpec.targetMaxBitrateKbps;
+  const plannedTotalDuration = ordered.reduce(
+    (acc, s) => acc + Math.max(0.5, s.end_time - s.start_time),
+    0
+  );
+  const safeCloudRunMaxKbps = Math.max(
+    450,
+    Math.floor(180000 / Math.max(10, plannedTotalDuration)) - 128
+  );
+  const audioKbps = 128;
+  const maxVideoKbps = Math.min(resSpec.targetMaxBitrateKbps, safeCloudRunMaxKbps);
   const runTag = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const tmpOutputPath = `${finalOutputPath}.${runTag}.tmp.mp4`;
 

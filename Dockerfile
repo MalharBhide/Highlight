@@ -1,8 +1,8 @@
 FROM node:24-bookworm-slim AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
+COPY package*.json ./
 # Use Debian's FFmpeg at runtime; esbuild uses its platform optional package.
-RUN npm ci --ignore-scripts
+RUN npm install --ignore-scripts
 COPY . .
 RUN npm run build
 
@@ -19,8 +19,8 @@ ENV NODE_ENV=production \
     FFMPEG_PATH=/usr/bin/ffmpeg \
     FFPROBE_PATH=/usr/bin/ffprobe \
     YT_DLP_BIN=/opt/yt-dlp/bin/yt-dlp
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts \
+COPY package*.json ./
+RUN npm install --omit=dev --ignore-scripts \
     && npm cache clean --force \
     && mkdir -p /app/storage \
     && chown node:node /app/storage

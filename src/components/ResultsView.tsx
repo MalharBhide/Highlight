@@ -115,15 +115,51 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
 
     try {
       setDownloadingMp4(true);
-      const res = await fetch(`/api/highlights/${encodedJobId}/download?download=1`, {
-        headers: getClientHeaders(),
-      });
-      if (!res.ok) {
-        const errData = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errData.error || 'Failed to download compiled MP4 video.');
+      const downloadUrl = `/api/highlights/${encodedJobId}/download?download=1`;
+      let mp4Blob: Blob;
+
+      try {
+        const res = await fetch(downloadUrl, {
+          headers: getClientHeaders(),
+        });
+        if (!res.ok) {
+          const errData = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(errData.error || 'Failed to download compiled MP4 video.');
+        }
+        const blob = await res.blob();
+        mp4Blob = new Blob([blob], { type: 'video/mp4' });
+      } catch (primaryErr) {
+        // Fallback: fetch in 8 MB byte ranges to bypass Cloud Run's 32 MB single-response limit
+        const chunkSize = 8 * 1024 * 1024;
+        const chunks: BlobPart[] = [];
+        let start = 0;
+        let totalSize = Infinity;
+        while (start < totalSize) {
+          const end = Math.min(start + chunkSize - 1, Number.isFinite(totalSize) ? totalSize - 1 : start + chunkSize - 1);
+          const rangeRes = await fetch(downloadUrl, {
+            headers: {
+              ...getClientHeaders(),
+              Range: `bytes=${start}-${end}`,
+            },
+          });
+          if (!rangeRes.ok && rangeRes.status !== 206) {
+            throw primaryErr;
+          }
+          const contentRange = rangeRes.headers.get('Content-Range');
+          const match = contentRange ? /bytes \d+-\d+\/(\d+)/.exec(contentRange) : null;
+          if (match) {
+            totalSize = parseInt(match[1], 10);
+          }
+          const buf = await rangeRes.arrayBuffer();
+          if (buf.byteLength === 0) break;
+          chunks.push(buf);
+          start += buf.byteLength;
+          if (!match || rangeRes.status === 200) break;
+        }
+        if (chunks.length === 0) throw primaryErr;
+        mp4Blob = new Blob(chunks, { type: 'video/mp4' });
       }
-      const blob = await res.blob();
-      const mp4Blob = new Blob([blob], { type: 'video/mp4' });
+
       const targetUrl = URL.createObjectURL(mp4Blob);
 
       const a = document.createElement('a');
