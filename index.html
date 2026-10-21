@@ -3,6 +3,42 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function () {
+        if (typeof window === 'undefined' || !window.WebSocket) return;
+        var NativeWebSocket = window.WebSocket;
+        function PatchedWebSocket(url, protocols) {
+          var urlStr = String(url || '');
+          var protoStr = Array.isArray(protocols) ? protocols.join(',') : String(protocols || '');
+          if (
+            protoStr.indexOf('vite-hmr') !== -1 ||
+            protoStr.indexOf('vite-ping') !== -1 ||
+            urlStr.indexOf(':24678') !== -1 ||
+            urlStr.indexOf('token=') !== -1
+          ) {
+            var dummy = new EventTarget();
+            dummy.url = urlStr;
+            dummy.readyState = 3;
+            dummy.protocol = '';
+            dummy.extensions = '';
+            dummy.bufferedAmount = 0;
+            dummy.binaryType = 'blob';
+            dummy.send = function () {};
+            dummy.close = function () {};
+            return dummy;
+          }
+          return protocols !== undefined
+            ? new NativeWebSocket(url, protocols)
+            : new NativeWebSocket(url);
+        }
+        PatchedWebSocket.prototype = NativeWebSocket.prototype;
+        PatchedWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+        PatchedWebSocket.OPEN = NativeWebSocket.OPEN;
+        PatchedWebSocket.CLOSING = NativeWebSocket.CLOSING;
+        PatchedWebSocket.CLOSED = NativeWebSocket.CLOSED;
+        window.WebSocket = PatchedWebSocket;
+      })();
+    </script>
     <title>Highlight — Watch less. See the best.</title>
     <meta name="description" content="Turn hours of content into minutes of the best moments. Highlight uses Gemini AI and audience engagement signals to automatically create your perfect highlight reel." />
     <meta property="og:title" content="Highlight — AI-Powered YouTube Highlight Generator" />

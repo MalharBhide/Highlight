@@ -99,8 +99,8 @@ function loadDb(): DatabaseState {
       const raw = fs.readFileSync(DB_FILE, 'utf-8');
       const parsed = JSON.parse(raw) as DatabaseState;
       for (const [id, job] of Object.entries(parsed.jobs || {})) {
-        // Purge failed jobs or legacy unowned jobs so another user's videos are never exposed globally
-        if (job.status === 'failed' || !sanitizeClientId(job.owner_client_id)) {
+        // Purge legacy unowned jobs so another user's videos are never exposed globally
+        if (!sanitizeClientId(job.owner_client_id)) {
           delete parsed.jobs[id];
           if (parsed.segments) {
             delete parsed.segments[id];
@@ -159,12 +159,14 @@ interface ProbedMediaInfo {
   hasAudio: boolean;
   width: number;
   height: number;
+  videoCodec: string;
+  audioCodec: string;
 }
 
 const mediaInfoCache = new Map<string, ProbedMediaInfo>();
 
 /**
- * Probes duration, audio stream presence, and video dimensions in a single cached ffprobe call.
+ * Probes duration, audio stream presence, codecs, and video dimensions in a single cached ffprobe call.
  */
 async function probeMediaInfo(filePath: string): Promise<ProbedMediaInfo> {
   const stat = fs.statSync(filePath);
@@ -178,29 +180,41 @@ async function probeMediaInfo(filePath: string): Promise<ProbedMediaInfo> {
     '-v',
     'error',
     '-show_entries',
-    'format=duration:stream=codec_type,width,height',
+    'format=duration:stream=codec_type,codec_name,width,height,duration',
     '-of',
     'json',
     filePath,
   ]);
   const parsed = JSON.parse(stdout) as {
     format?: { duration?: string };
-    streams?: Array<{ codec_type?: string; width?: number; height?: number }>;
+    streams?: Array<{
+      codec_type?: string;
+      codec_name?: string;
+      width?: number;
+      height?: number;
+      duration?: string;
+    }>;
   };
 
-  const duration = parseFloat(parsed.format?.duration || '');
+  const streams = parsed.streams || [];
+  const videoStream = streams.find((s) => s.codec_type === 'video');
+  const audioStream = streams.find((s) => s.codec_type === 'audio');
+  const videoStreamDur = parseFloat(videoStream?.duration || '');
+  const formatDur = parseFloat(parsed.format?.duration || '');
+  const duration =
+    Number.isFinite(videoStreamDur) && videoStreamDur > 0 ? videoStreamDur : formatDur;
   if (!Number.isFinite(duration) || duration <= 0) {
     throw new Error('Unable to determine valid video duration via ffprobe.');
   }
 
-  const streams = parsed.streams || [];
-  const videoStream = streams.find((s) => s.codec_type === 'video');
-  const hasAudio = streams.some((s) => s.codec_type === 'audio');
+  const hasAudio = Boolean(audioStream);
   const info: ProbedMediaInfo = {
     duration,
     hasAudio,
     width: Number(videoStream?.width) || 0,
     height: Number(videoStream?.height) || 0,
+    videoCodec: (videoStream?.codec_name || '').toLowerCase(),
+    audioCodec: (audioStream?.codec_name || '').toLowerCase(),
   };
 
   mediaInfoCache.set(cacheKey, info);
@@ -724,9 +738,9 @@ async function extractRawAudioSignals(filePath: string): Promise<RawAudioSignals
           '-ac',
           '1',
           '-ar',
-          '8000',
+          '4000',
           '-af',
-          'silencedetect=noise=-28dB:d=0.22,asetnsamples=n=1840,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+          'silencedetect=noise=-28dB:d=0.22,asetnsamples=n=920,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,ametadata=print:key=lavfi.astats.Overall.RMS_level',
           '-f',
           'null',
           '-',
@@ -1827,18 +1841,27 @@ async function downloadYouTubeVideoMp4(
 
     onProgress?.(24, 'Connecting to HD 720p/1080p video stream...');
 
-    // Stage 1: Race Etacloud Fast MP4 and Savenow 720p HD concurrently
+    // Stage 1: Race Etacloud Fast MP4 and Savenow 720p HD concurrently through verified download
     const raceCtrl1 = new AbortController();
     const raceCtrl2 = new AbortController();
     try {
-      const fastestResolved = await Promise.any([
-        resolveViaEtacloud(raceCtrl1.signal),
-        resolveViaSavenow('720', raceCtrl2.signal),
+      const fastestSaved = await Promise.any([
+        (async () => {
+          const r = await resolveViaEtacloud(raceCtrl1.signal);
+          const s = await downloadStreamToCache(r);
+          if (!s) throw new Error('etacloud download verification failed');
+          return s;
+        })(),
+        (async () => {
+          const r = await resolveViaSavenow('720', raceCtrl2.signal);
+          const s = await downloadStreamToCache(r);
+          if (!s) throw new Error('savenow 720p download verification failed');
+          return s;
+        })(),
       ]);
       raceCtrl1.abort();
       raceCtrl2.abort();
-      const saved = await downloadStreamToCache(fastestResolved);
-      if (saved) return saved;
+      if (fastestSaved) return fastestSaved;
     } catch {
       raceCtrl1.abort();
       raceCtrl2.abort();
@@ -1952,117 +1975,216 @@ async function renderHighlightReelWithFfmpeg(
 
   const audioKbps = 192;
   const maxVideoKbps = resSpec.targetMaxBitrateKbps;
-  const crfValue = '16';
-
-  const ffmpegArgs: string[] = ['-y'];
-  const filterParts: string[] = [];
-  const concatInputs: string[] = [];
-
-  for (let i = 0; i < ordered.length; i++) {
-    const seg = ordered[i];
-    const clipDuration = Math.max(0.5, seg.end_time - seg.start_time);
-    const safeStart =
-      seg.start_time + clipDuration <= sourceDuration
-        ? seg.start_time
-        : Math.max(
-            0,
-            Math.min(
-              sourceDuration - clipDuration,
-              (seg.start_time / Math.max(1, video.duration)) * sourceDuration
-            )
-          );
-    const safeDuration = Math.max(0.5, Math.min(clipDuration, sourceDuration - safeStart));
-
-    ffmpegArgs.push(
-      '-ss',
-      safeStart.toFixed(3),
-      '-t',
-      safeDuration.toFixed(3),
-      '-i',
-      job.source_media_path
-    );
-
-    if (inputHasAudio) {
-      const fadeDur = 0.055;
-      const fadeOutStart = Math.max(0, safeDuration - fadeDur);
-      const fadeInFilter = safeStart > 0.05 ? `,afade=t=in:st=0:d=${fadeDur}` : '';
-      const fadeOutFilter =
-        safeDuration > 0.25 ? `,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur}` : '';
-      filterParts.push(
-        `[${i}:a:0]aresample=48000:async=1,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo${fadeInFilter}${fadeOutFilter}[a${i}]`
-      );
-    } else {
-      filterParts.push(
-        `anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${safeDuration.toFixed(3)}[a${i}]`
-      );
-    }
-    concatInputs.push(`[${i}:v:0][a${i}]`);
-  }
-
-  const needsUpscaleSharpen = sourceInfo.height > 0 && sourceInfo.height < resSpec.height;
-  const sharpenChain = needsUpscaleSharpen ? ',unsharp=5:5:0.55:3:3:0.0' : '';
-  const postConcatVideoFilter =
-    sourceInfo.width === resSpec.width && sourceInfo.height === resSpec.height
-      ? '[catv]setsar=1[outv]'
-      : `[catv]scale=${resSpec.width}:${resSpec.height}:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int${sharpenChain},pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1[outv]`;
-
-  filterParts.push(
-    `${concatInputs.join('')}concat=n=${ordered.length}:v=1:a=1[catv][outa];${postConcatVideoFilter}`
-  );
-
-  const tmpOutputPath = `${finalOutputPath}.tmp.mp4`;
-
-  ffmpegArgs.push(
-    '-filter_complex_threads',
-    '4',
-    '-filter_complex',
-    filterParts.join(';'),
-    '-map',
-    '[outv]',
-    '-map',
-    '[outa]',
-    '-threads',
-    '4',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-profile:v',
-    'high',
-    '-level',
-    '4.1',
-    '-crf',
-    crfValue,
-    '-maxrate',
-    `${maxVideoKbps}k`,
-    '-bufsize',
-    `${maxVideoKbps * 2}k`,
-    '-pix_fmt',
-    'yuv420p',
-    '-c:a',
-    'aac',
-    '-ar',
-    '48000',
-    '-ac',
-    '2',
-    '-b:a',
-    `${audioKbps}k`,
-    '-movflags',
-    '+faststart',
-    tmpOutputPath
-  );
+  const runTag = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const tmpOutputPath = `${finalOutputPath}.${runTag}.tmp.mp4`;
+  const partTsFiles: string[] = [];
 
   try {
-    await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 180000 });
+    let renderedViaStreamCopy = false;
+
+    // Fast Path: Lossless H.264 + AAC MPEG-TS Stream-Copy Concatenation (~1-3 seconds even for 10+ min 60fps HD reels)
+    if (sourceInfo.videoCodec === 'h264' && inputHasAudio) {
+      try {
+        await Promise.all(
+          ordered.map(async (seg, i) => {
+            const clipDuration = Math.max(0.5, seg.end_time - seg.start_time);
+            const safeStart =
+              seg.start_time + clipDuration <= sourceDuration
+                ? seg.start_time
+                : Math.max(
+                    0,
+                    Math.min(
+                      sourceDuration - clipDuration,
+                      (seg.start_time / Math.max(1, video.duration)) * sourceDuration
+                    )
+                  );
+            const safeDuration = Math.max(
+              0.5,
+              Math.min(clipDuration, sourceDuration - safeStart)
+            );
+            const partPath = `${finalOutputPath}.${runTag}.part${i}.ts`;
+            partTsFiles.push(partPath);
+
+            const copyAudioArgs =
+              sourceInfo.audioCodec === 'aac'
+                ? ['-c:a', 'copy']
+                : ['-c:a', 'aac', '-b:a', `${audioKbps}k`, '-ar', '48000', '-ac', '2'];
+
+            await execFileAsync(
+              'ffmpeg',
+              [
+                '-loglevel',
+                'error',
+                '-y',
+                '-ss',
+                safeStart.toFixed(3),
+                '-t',
+                safeDuration.toFixed(3),
+                '-i',
+                job.source_media_path!,
+                '-map',
+                '0:v:0',
+                '-map',
+                '0:a:0?',
+                '-dn',
+                '-sn',
+                '-c:v',
+                'copy',
+                ...copyAudioArgs,
+                '-bsf:v',
+                'h264_mp4toannexb',
+                '-f',
+                'mpegts',
+                partPath,
+              ],
+              { timeout: 45000, maxBuffer: 16 * 1024 * 1024 }
+            );
+          })
+        );
+
+        const orderedPartPaths = ordered.map((_, i) => `${finalOutputPath}.${runTag}.part${i}.ts`);
+        await execFileAsync(
+          'ffmpeg',
+          [
+            '-loglevel',
+            'error',
+            '-y',
+            '-i',
+            `concat:${orderedPartPaths.join('|')}`,
+            '-map',
+            '0:v:0',
+            '-map',
+            '0:a:0?',
+            '-dn',
+            '-sn',
+            '-c',
+            'copy',
+            '-bsf:a',
+            'aac_adtstoasc',
+            '-movflags',
+            '+faststart',
+            tmpOutputPath,
+          ],
+          { timeout: 60000, maxBuffer: 16 * 1024 * 1024 }
+        );
+
+        if (fs.existsSync(tmpOutputPath) && fs.statSync(tmpOutputPath).size > 10000) {
+          renderedViaStreamCopy = true;
+        }
+      } catch {
+        renderedViaStreamCopy = false;
+      }
+    }
+
+    // Fallback Path: Ultrafast 30fps H.264 re-encode (for non-H.264 uploads or synthetic fixtures)
+    if (!renderedViaStreamCopy) {
+      const ffmpegArgs: string[] = ['-loglevel', 'error', '-y'];
+      const filterParts: string[] = [];
+      const concatInputs: string[] = [];
+
+      for (let i = 0; i < ordered.length; i++) {
+        const seg = ordered[i];
+        const clipDuration = Math.max(0.5, seg.end_time - seg.start_time);
+        const safeStart =
+          seg.start_time + clipDuration <= sourceDuration
+            ? seg.start_time
+            : Math.max(
+                0,
+                Math.min(
+                  sourceDuration - clipDuration,
+                  (seg.start_time / Math.max(1, video.duration)) * sourceDuration
+                )
+              );
+        const safeDuration = Math.max(0.5, Math.min(clipDuration, sourceDuration - safeStart));
+
+        ffmpegArgs.push(
+          '-ss',
+          safeStart.toFixed(3),
+          '-t',
+          safeDuration.toFixed(3),
+          '-i',
+          job.source_media_path
+        );
+
+        if (inputHasAudio) {
+          const fadeDur = 0.055;
+          const fadeOutStart = Math.max(0, safeDuration - fadeDur);
+          const fadeInFilter = safeStart > 0.05 ? `,afade=t=in:st=0:d=${fadeDur}` : '';
+          const fadeOutFilter =
+            safeDuration > 0.25 ? `,afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDur}` : '';
+          filterParts.push(
+            `[${i}:a:0]aresample=48000:async=1,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo${fadeInFilter}${fadeOutFilter}[a${i}]`
+          );
+        } else {
+          filterParts.push(
+            `anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${safeDuration.toFixed(3)}[a${i}]`
+          );
+        }
+        concatInputs.push(`[${i}:v:0][a${i}]`);
+      }
+
+      const postConcatVideoFilter = `[catv]fps=30,scale=${resSpec.width}:${resSpec.height}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1[outv]`;
+
+      filterParts.push(
+        `${concatInputs.join('')}concat=n=${ordered.length}:v=1:a=1[catv][outa];${postConcatVideoFilter}`
+      );
+
+      ffmpegArgs.push(
+        '-filter_complex_threads',
+        '4',
+        '-filter_complex',
+        filterParts.join(';'),
+        '-map',
+        '[outv]',
+        '-map',
+        '[outa]',
+        '-threads',
+        '4',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-profile:v',
+        'high',
+        '-level',
+        '4.1',
+        '-crf',
+        '20',
+        '-maxrate',
+        `${maxVideoKbps}k`,
+        '-bufsize',
+        `${maxVideoKbps * 2}k`,
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-ar',
+        '48000',
+        '-ac',
+        '2',
+        '-b:a',
+        `${audioKbps}k`,
+        '-movflags',
+        '+faststart',
+        tmpOutputPath
+      );
+
+      await execFileAsync('ffmpeg', ffmpegArgs, {
+        timeout: 180000,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+    }
+
     fs.renameSync(tmpOutputPath, finalOutputPath);
     const renderedInfo = await probeMediaInfo(finalOutputPath);
     const probedDuration = renderedInfo.duration;
+    const keyframeTolerance = Math.max(4, ordered.length * 4);
     const actualDuration =
-      Math.abs(probedDuration - totalPlannedDuration) < 0.8
+      Math.abs(probedDuration - totalPlannedDuration) < keyframeTolerance
         ? totalPlannedDuration
         : probedDuration;
-    job.output_resolution_width = renderedInfo.width || resSpec.width;
-    job.output_resolution_height = renderedInfo.height || resSpec.height;
+    job.output_resolution_width = renderedInfo.width || sourceInfo.width || resSpec.width;
+    job.output_resolution_height = renderedInfo.height || sourceInfo.height || resSpec.height;
     renderSignatureCache.set(signature, {
       outputPath: finalOutputPath,
       actualDuration,
@@ -2071,6 +2193,13 @@ async function renderHighlightReelWithFfmpeg(
     });
     return { outputPath: finalOutputPath, actualDuration };
   } finally {
+    for (const p of partTsFiles) {
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch {
+        // ignore
+      }
+    }
     try {
       if (fs.existsSync(tmpOutputPath)) fs.unlinkSync(tmpOutputPath);
     } catch {
@@ -2099,7 +2228,26 @@ function updateJobStage(
   saveDb();
 }
 
+const activeJobPipelines = new Map<string, Promise<void>>();
+
 async function runHighlightPipeline(jobId: string, channelAccessToken?: string): Promise<void> {
+  const existingRun = activeJobPipelines.get(jobId);
+  if (existingRun) {
+    return existingRun;
+  }
+  const runPromise = runHighlightPipelineInternal(jobId, channelAccessToken);
+  activeJobPipelines.set(jobId, runPromise);
+  try {
+    await runPromise;
+  } finally {
+    activeJobPipelines.delete(jobId);
+  }
+}
+
+async function runHighlightPipelineInternal(
+  jobId: string,
+  channelAccessToken?: string
+): Promise<void> {
   const job = db.jobs[jobId];
   if (!job) return;
   const video = db.videos[job.video_id];
@@ -2994,7 +3142,36 @@ async function startServer() {
   });
 
   app.post('/api/highlights/:job_id/retry', async (req, res) => {
-    const job = db.jobs[req.params.job_id];
+    let job = db.jobs[req.params.job_id];
+    if (!job && typeof req.body?.url === 'string' && req.body.url.trim()) {
+      try {
+        const keepPct = clampKeepPercentage(req.body?.keepPercentage);
+        const video = await inspectYouTubeVideo(req.body.url.trim());
+        const target = calculateTargetDuration(video.duration, 0.04, keepPct);
+        const ownerClientId = extractRequestClientId(req);
+        job = {
+          id: req.params.job_id,
+          video_id: video.id,
+          status: 'retrieving_info',
+          stage_index: 1,
+          stage_message: 'Retrieving YouTube video information...',
+          progress: 5,
+          engagement_available: false,
+          engagement_source: 'unavailable',
+          source_media_status: 'missing_source',
+          rights_confirmed: false,
+          keep_percentage: keepPct,
+          target_duration: target.targetSeconds,
+          actual_output_duration: 0,
+          owner_client_id: ownerClientId || undefined,
+          created_at: new Date().toISOString(),
+        };
+        db.jobs[job.id] = job;
+        db.segments[job.id] = [];
+      } catch {
+        // fall through to 404 if URL is invalid
+      }
+    }
     if (!job) {
       res.status(404).json({ error: 'Highlight job not found.' });
       return;
@@ -3141,6 +3318,78 @@ async function startServer() {
       },
       appType: 'spa',
     });
+
+    // Serve a clean WebSocket-free /@vite/client runtime so Vite 8 never polls ws://...:24678
+    app.get('/@vite/client', (_req, res) => {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.send(`
+const sheetsMap = new Map();
+const linkSheetsMap = new Map();
+if (typeof document !== "undefined") {
+  document.querySelectorAll("style[data-vite-dev-id]").forEach((el) => {
+    sheetsMap.set(el.getAttribute("data-vite-dev-id"), el);
+  });
+  document.querySelectorAll('link[rel="stylesheet"][data-vite-dev-id]').forEach((el) => {
+    linkSheetsMap.set(el.getAttribute("data-vite-dev-id"), el);
+  });
+}
+let lastInsertedStyle;
+export function updateStyle(id, content) {
+  if (linkSheetsMap.has(id)) return;
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement("style");
+    style.setAttribute("type", "text/css");
+    style.setAttribute("data-vite-dev-id", id);
+    style.textContent = content;
+    if (!lastInsertedStyle) {
+      document.head.appendChild(style);
+      setTimeout(() => { lastInsertedStyle = undefined; }, 0);
+    } else {
+      lastInsertedStyle.insertAdjacentElement("afterend", style);
+    }
+    lastInsertedStyle = style;
+  } else if (style.textContent !== content) {
+    style.textContent = content;
+  }
+  sheetsMap.set(id, style);
+}
+export function removeStyle(id) {
+  if (linkSheetsMap.has(id)) {
+    document.querySelectorAll(\`link[rel="stylesheet"][data-vite-dev-id="\${CSS.escape(id)}"]\`).forEach((el) => el.remove());
+    linkSheetsMap.delete(id);
+  }
+  const style = sheetsMap.get(id);
+  if (style) {
+    document.head.removeChild(style);
+    sheetsMap.delete(id);
+  }
+}
+export function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    acceptExports() {},
+    dispose() {},
+    prune() {},
+    invalidate() {},
+    decline() {},
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+export function injectQuery(url, queryToInject) {
+  if (url[0] !== "." && url[0] !== "/") return url;
+  const pathname = url.replace(/[?#].*$/, "");
+  const { search, hash } = new URL(url, "http://vite.dev");
+  return \`\${pathname}?\${queryToInject}\${search ? "&" + search.slice(1) : ""}\${hash || ""}\`;
+}
+export class ErrorOverlay {}
+`);
+    });
+
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), 'dist');

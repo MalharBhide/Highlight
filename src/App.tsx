@@ -141,7 +141,7 @@ export default function App() {
 
   useEffect(() => {
     if (screen !== 'processing' || !activeJobId) return;
-    if (activeJobStatus === 'complete' || activeJobStatus === 'failed') return;
+    if (activeJobStatus === 'complete') return;
 
     let cancelled = false;
     let inFlight = false;
@@ -264,12 +264,18 @@ export default function App() {
 
   const handleRetryJob = async () => {
     if (!activeJob) return;
-    const res = await fetch(`/api/highlights/${activeJob.id}/retry`, {
+    const res = await fetch(`/api/highlights/${encodeURIComponent(activeJob.id)}/retry`, {
       method: 'POST',
-      headers: getClientHeaders(),
+      headers: getClientHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        url: activeVideo?.original_url || urlInput,
+        keepPercentage: activeJob.keep_percentage ?? keepPercentage,
+      }),
     });
     if (res.ok) {
       await loadJobDetails(activeJob.id);
+    } else if (activeVideo?.original_url) {
+      await handleGenerateHighlights(activeVideo.original_url);
     }
   };
 
