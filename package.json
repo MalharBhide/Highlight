@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist dist-server",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test src/lib/*.test.ts tests/*.test.ts"
+    "test": "node --import tsx --test src/lib/*.test.ts tests/*.test.ts",
+    "test:docker": "node --test tests/container.test.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

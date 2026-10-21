@@ -14,8 +14,11 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: npm ci --ignore-scripts
       - run: npm run lint
+      - run: npm run build
       - run: npm test
         env:
+          HIGHLIGHT_TEST_SERVER: dist-server/server.js
           FFMPEG_PATH: /usr/bin/ffmpeg
           FFPROBE_PATH: /usr/bin/ffprobe
-      - run: npm run build
+      - run: docker build -t highlight:test .
+      - run: npm run test:docker

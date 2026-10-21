@@ -31,15 +31,7 @@ npm start
 
 The build creates `dist/` for the frontend and `dist-server/server.js` for the server. `npm start` serves both in production mode. `npm run preview` previews only the static frontend and is not the full application.
 
-The fixes are local until committed and pushed. If using the repair branch from this workspace, publish it with:
-
-```bash
-git add .
-git commit -m "Fix video analysis, rendering, access checks, and deployment"
-git push -u https://github.com/MalharBhide/Highlight.git codex/fix-highlight
-```
-
-Select that branch in Render, or merge it into `main` first.
+Deploy the `main` branch, which contains the repaired application and deployment configuration.
 
 ## Configuration
 
@@ -65,7 +57,7 @@ The browser stores a random capability token locally. Job APIs require this toke
 Use a **Docker Web Service with a persistent disk**. The included `render.yaml` defines one paid `1c-2g` instance (1 CPU, 2 GB RAM) and a 20 GB disk. Review Render's current cost before creating it. Video rendering needs CPU, memory, and persistent disk; a static website host alone cannot run this application.
 
 1. Commit and push the repaired code, including `Dockerfile`, `package-lock.json`, and `render.yaml`, to your GitHub repository.
-2. In Render, choose **New → Blueprint**, connect the repository, and select the branch containing the fixes. Render reads `render.yaml`.
+2. In Render, choose **New → Blueprint**, connect the repository, and select `main`. Render reads `render.yaml`.
 3. Enter your `GEMINI_API_KEY`. Supply `YOUTUBE_API_KEY` if you have one; otherwise leave it blank. If needed, change `GEMINI_MODEL` to a video-capable model your Google account can access.
 4. Review the paid service and disk configuration, then deploy. The Docker image installs Node, FFmpeg, FFprobe, Python, and yt-dlp automatically.
 5. Open the generated `https://…onrender.com` URL. `/healthz` should return `{"status":"ok"}`. Test a short video upload, wait for completion, play it, and download the MP4. Then test a YouTube URL.
@@ -96,3 +88,16 @@ A VPS or another Docker host can run this image. Put HTTPS in front of it and pe
 - Tests cover scoring, duration selection, the Gemini upload/processing/request/cleanup contract with a mock client, ownership on every job endpoint, rejected-upload cleanup, MP4 downloads, suffix/invalid byte ranges, and actual FFmpeg rendering with and without source audio.
 
 Live Gemini and YouTube behavior still depends on valid credentials and external service access. Mock tests do not establish that a particular API key or hosted IP has access. The Docker image must also be built on a machine with a running Docker daemon.
+
+## Verify the deployment image
+
+With Docker running:
+
+```bash
+docker build -t highlight:test .
+npm run test:docker
+```
+
+This test starts an isolated non-root container with a temporary persistent volume, checks the homepage and built assets, verifies FFmpeg/FFprobe and yt-dlp, compiles a real video, downloads it, and confirms the reel remains available after a restart. It removes its test container and volume afterwards.
+
+The API integration suite also exercises every supported percentage from 5% through 50%, source replacement, changing a reel's percentage, retries, explicit rendering, persistence, and missing-key failures. GitHub Actions runs the production build and both test suites on each push.

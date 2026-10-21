@@ -33,7 +33,7 @@ test('HTTP ownership, upload validation, and real FFmpeg compilation', { timeout
   }));
   const serverEntry = process.env.HIGHLIGHT_TEST_SERVER || 'server.ts';
   const serverArgs = serverEntry.endsWith('.ts') ? ['--import', 'tsx', serverEntry] : [serverEntry];
-  const child = spawn(process.execPath, serverArgs, {
+  let child = spawn(process.execPath, serverArgs, {
     cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, NODE_ENV: 'production', PORT: String(port), STORAGE_DIR: storage, MEDIA_STORAGE_DIR: storage, GEMINI_API_KEY: '', ALLOW_HEURISTIC_FALLBACK: 'true', FFMPEG_PATH: ffmpeg, FFPROBE_PATH: ffprobe, YT_DLP_BIN: '/nonexistent-highlight-test-yt-dlp' },
   });
@@ -46,7 +46,7 @@ test('HTTP ownership, upload validation, and real FFmpeg compilation', { timeout
     fs.rmSync(storage, { recursive: true, force: true });
   });
   let ready = false;
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 300; i++) {
     if (await fetch(`${base}/healthz`).then((r) => r.ok, () => false)) { ready = true; break; }
     if (child.exitCode !== null) break;
     await delay(100);
@@ -66,7 +66,7 @@ test('HTTP ownership, upload validation, and real FFmpeg compilation', { timeout
 
   assert.equal((await request('/api/highlights/job-fail/retry', { method: 'POST' })).status, 200);
   let failedJob: any;
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 300; i++) {
     failedJob = await (await request('/api/highlights/job-fail')).json();
     if (failedJob.job.status === 'failed') break;
     await delay(50);
@@ -85,20 +85,26 @@ test('HTTP ownership, upload validation, and real FFmpeg compilation', { timeout
   assert.equal((await upload(Buffer.from('not a video'), 'bad.mp4', 20)).status, 400);
   assert.equal(fs.readdirSync(path.join(storage, 'uploads')).length, 0, fs.readdirSync(path.join(storage, 'uploads')).join(', ') + logs);
 
-  for (const [source, percentage] of [[input, 20], [silent, 50], [input, 5]] as const) {
+  const waitForJob = async (id: string) => {
+    let details: any;
+    for (let i = 0; i < 200; i++) {
+      details = await (await request(`/api/highlights/${id}`)).json();
+      if (['complete', 'failed'].includes(details.job.status)) break;
+      await delay(150);
+    }
+    assert.equal(details.job.status, 'complete', JSON.stringify(details) + logs);
+    return details;
+  };
+  let persistedJobId: string | undefined;
+  for (const percentage of [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]) {
+    const source = percentage === 50 ? silent : input;
     const response = await upload(fs.readFileSync(source), path.basename(source), percentage);
     assert.equal(response.status, 201, await response.clone().text());
     const { job } = await response.json();
     for (const [suffix, method] of [['', 'GET'], ['/segments', 'GET'], ['/download', 'GET'], ['', 'DELETE'], ['/retry', 'POST'], ['/render', 'POST'], ['/source', 'POST'], ['/keep-percentage', 'POST']]) {
       assert.equal((await request(`/api/highlights/${job.id}${suffix}`, { method }, stranger)).status, 404, `${method} ${suffix}`);
     }
-    let details: any;
-    for (let i = 0; i < 200; i++) {
-      details = await (await request(`/api/highlights/${job.id}`)).json();
-      if (['complete', 'failed'].includes(details.job.status)) break;
-      await delay(150);
-    }
-    assert.equal(details.job.status, 'complete', JSON.stringify(details) + logs);
+    const details = await waitForJob(job.id);
     assert.equal(details.job.analysis_mode, 'heuristic');
     assert.ok(details.job.download_ready);
     assert.equal(details.job.source_media_path, undefined);
@@ -114,7 +120,56 @@ test('HTTP ownership, upload validation, and real FFmpeg compilation', { timeout
     assert.equal(ranged.status, 206);
     assert.equal((await ranged.arrayBuffer()).byteLength, 10);
     assert.equal((await request(`/api/highlights/${job.id}/download`, { headers: { Range: 'bytes=999999999-' } })).status, 416);
+    if (percentage === 20) {
+      const change = await request(`/api/highlights/${job.id}/keep-percentage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keepPercentage: 35 }),
+      });
+      assert.equal(change.status, 200);
+      const changed = await waitForJob(job.id);
+      assert.equal(changed.job.keep_percentage, 35);
+      assert.ok(Math.abs(changed.job.actual_output_duration - 7) < 0.5);
+      assert.equal((await request(`/api/highlights/${job.id}/retry`, { method: 'POST' })).status, 200);
+      assert.equal((await waitForJob(job.id)).job.download_ready, true);
+      assert.equal((await request(`/api/highlights/${job.id}/render`, { method: 'POST' })).status, 202);
+      await waitForJob(job.id);
+      const replacement = new FormData();
+      replacement.append('file', new Blob([fs.readFileSync(silent)], { type: 'video/mp4' }), 'replacement.mp4');
+      replacement.append('rightsConfirmed', 'true');
+      assert.equal((await request(`/api/highlights/${job.id}/source`, { method: 'POST', body: replacement })).status, 200);
+      assert.equal((await waitForJob(job.id)).job.download_ready, true);
+    }
+    if (percentage === 50) { persistedJobId = job.id; continue; }
     assert.equal((await request(`/api/highlights/${job.id}`, { method: 'DELETE' })).status, 200);
     assert.equal((await request(`/api/highlights/${job.id}`)).status, 404);
   }
+  // Confirm a restart preserves finished reels and the default mode does not hide missing Gemini credentials.
+  child.kill('SIGTERM');
+  await new Promise((resolve) => child.once('exit', resolve));
+  child = spawn(process.execPath, serverArgs, {
+    cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), STORAGE_DIR: storage, MEDIA_STORAGE_DIR: storage,
+      GEMINI_API_KEY: '', ALLOW_HEURISTIC_FALLBACK: 'false', FFMPEG_PATH: ffmpeg, FFPROBE_PATH: ffprobe },
+  });
+  child.stdout.on('data', (chunk) => { logs += chunk; });
+  child.stderr.on('data', (chunk) => { logs += chunk; });
+  ready = false;
+  for (let i = 0; i < 300; i++) {
+    if (await fetch(`${base}/healthz`).then((r) => r.ok, () => false)) { ready = true; break; }
+    if (child.exitCode !== null) break;
+    await delay(100);
+  }
+  assert.ok(ready, logs);
+  assert.equal((await (await request(`/api/highlights/${persistedJobId}`)).json()).job.download_ready, true);
+  const noAiResponse = await upload(fs.readFileSync(input), 'requires-ai.mp4', 20);
+  assert.equal(noAiResponse.status, 201);
+  const noAiJob = (await noAiResponse.json()).job;
+  let noAiDetails: any;
+  for (let i = 0; i < 200; i++) {
+    noAiDetails = await (await request(`/api/highlights/${noAiJob.id}`)).json();
+    if (['failed', 'complete'].includes(noAiDetails.job.status)) break;
+    await delay(100);
+  }
+  assert.equal(noAiDetails.job.status, 'failed');
+  assert.match(noAiDetails.job.error, /GEMINI_API_KEY/);
+  assert.equal(noAiDetails.job.download_ready, false);
 });
