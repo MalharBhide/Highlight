@@ -11,3 +11,7 @@ coverage/
 .data/highlight-storage/renders/
 .data/highlight-storage/*.mp4
 
+
+dist-server/
+.data/
+.aistudio/

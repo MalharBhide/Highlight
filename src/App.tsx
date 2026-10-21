@@ -151,6 +151,8 @@ export default function App() {
       inFlight = true;
       try {
         await loadJobDetails(activeJobId);
+      } catch {
+        // A transient polling error should not terminate progress updates.
       } finally {
         inFlight = false;
       }
@@ -161,7 +163,7 @@ export default function App() {
     }, 150);
     const timer = setInterval(() => {
       void poll();
-    }, 450);
+    }, 1500);
 
     return () => {
       cancelled = true;
@@ -282,12 +284,14 @@ export default function App() {
   const handleDeleteJob = useCallback(
     async (jobId: string) => {
       try {
-        await fetch(`/api/highlights/${encodeURIComponent(jobId)}`, {
+        const response = await fetch(`/api/highlights/${encodeURIComponent(jobId)}`, {
           method: 'DELETE',
           headers: getClientHeaders(),
         });
-      } catch {
-        // ignore network error
+        if (!response.ok) throw new Error('Could not delete this reel. Please try again.');
+      } catch (error) {
+        setErrorMsg(error instanceof Error ? error.message : 'Could not delete this reel.');
+        return;
       }
       removeOwnedJobId(jobId);
       setRecentJobs((prev) => prev.filter((item) => item.job.id !== jobId));

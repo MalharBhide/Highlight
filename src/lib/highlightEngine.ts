@@ -1,7 +1,7 @@
 /**
  * Pure core logic for Highlight:
  * - YouTube URL validation & ID extraction
- * - Target duration formula: T_highlight = min(0.20 * T_original, 600)
+ * - Target duration formula: T_highlight = (keepPercentage / 100) * T_original
  * - Audience engagement timeline smoothing & local prominence peak detection
  * - Gemini AI candidate validation & timestamp clamping
  * - Intro & Outro detection and guaranteed incorporation alongside actual Best Moments
@@ -60,7 +60,7 @@ export interface HighlightJobRecord {
   download_location?: string;
   video_summary?: string;
   video_category?: string;
-  analysis_mode?: 'gemini_live' | 'development_fixture';
+  analysis_mode?: 'gemini_live' | 'development_fixture' | 'heuristic';
   engagement_timeline?: EngagementPoint[];
   owner_client_id?: string;
   output_resolution_width?: number;
@@ -123,6 +123,7 @@ export interface AICandidateHighlight {
 }
 
 export interface GeminiAnalysisSchema {
+  analysis_mode?: 'heuristic';
   video_summary: string;
   video_category: string;
   highlights: AICandidateHighlight[];

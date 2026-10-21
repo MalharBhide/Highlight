@@ -2,6 +2,7 @@ import { sanitizeClientId } from './highlightEngine';
 
 const CLIENT_ID_STORAGE_KEY = 'highlight_client_id_v2';
 const OWNED_JOBS_STORAGE_KEY = 'highlight_owned_jobs_v2';
+let memoryClientId: string | undefined;
 
 function generateRandomClientId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -16,16 +17,17 @@ export function getOrCreateClientId(): string {
   if (typeof window === 'undefined') {
     return 'hc-ssr-placeholder-0000';
   }
+  if (memoryClientId) return memoryClientId;
   try {
     const existing = sanitizeClientId(window.localStorage.getItem(CLIENT_ID_STORAGE_KEY));
     if (existing) {
-      return existing;
+      return (memoryClientId = existing);
     }
     const created = generateRandomClientId();
     window.localStorage.setItem(CLIENT_ID_STORAGE_KEY, created);
-    return created;
+    return (memoryClientId = created);
   } catch {
-    return generateRandomClientId();
+    return (memoryClientId = generateRandomClientId());
   }
 }
 

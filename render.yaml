@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: highlight
+    runtime: docker
+    plan: 1c-2g
+    healthCheckPath: /healthz
+    numInstances: 1
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: STORAGE_DIR
+        value: /app/storage
+      - key: ALLOW_HEURISTIC_FALLBACK
+        value: "false"
+    disk:
+      name: highlight-storage
+      mountPath: /app/storage
+      sizeGB: 20

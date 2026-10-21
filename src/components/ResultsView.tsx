@@ -67,7 +67,7 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
     (job.actual_output_duration || 0) * 100
   )}`;
   const directMp4Url = `${window.location.origin}/api/highlights/${encodedJobId}/download`;
-  const playbackMp4Url = `${directMp4Url}?v=${streamVersion}`;
+  const playbackMp4Url = `${directMp4Url}?v=${streamVersion}&clientId=${encodeURIComponent(getOrCreateClientId())}`;
 
   const compiledTimeline = useMemo(() => {
     let offset = 0;
@@ -241,6 +241,12 @@ export const ResultsView: React.FC<ResultsViewProps> = ({
             )}
           </div>
         </div>
+
+        {job.analysis_mode === 'heuristic' && (
+          <p role="status" className="mb-5 text-sm text-amber-700">
+            Gemini was unavailable. These clips were selected using audio energy and timing; their content has not been analyzed by AI.
+          </p>
+        )}
 
         {actionError && (
           <div
