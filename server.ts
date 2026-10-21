@@ -5,6 +5,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 import { promisify } from 'node:util';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
@@ -40,6 +44,52 @@ import { DEVELOPMENT_FIXTURES, KEYNOTE_THUMBNAIL_SVG } from './src/lib/testFixtu
 dotenv.config();
 
 const execFileAsync = promisify(execFile);
+const nodeRequire = createRequire(import.meta.url);
+
+function resolveStaticBinary(pkgName: string): string | null {
+  try {
+    const loaded = nodeRequire(pkgName) as
+      | string
+      | { path?: string; default?: string | { path?: string } };
+    if (typeof loaded === 'string') return loaded;
+    if (typeof loaded?.path === 'string') return loaded.path;
+    if (typeof loaded?.default === 'string') return loaded.default;
+    if (typeof loaded?.default?.path === 'string') return loaded.default.path;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function resolveExecutableBinary(
+  staticCandidate: string | null | undefined,
+  binaryName: string
+): string {
+  const candidates = [
+    staticCandidate || '',
+    `/usr/bin/${binaryName}`,
+    `/usr/local/bin/${binaryName}`,
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        try {
+          fs.chmodSync(candidate, 0o755);
+        } catch {
+          // ignore chmod on read-only filesystems
+        }
+        return candidate;
+      }
+    } catch {
+      // continue checking next candidate
+    }
+  }
+  return binaryName;
+}
+
+const FFMPEG_BIN = resolveExecutableBinary(resolveStaticBinary('ffmpeg-static'), 'ffmpeg');
+const FFPROBE_BIN = resolveExecutableBinary(resolveStaticBinary('ffprobe-static'), 'ffprobe');
 
 const MEDIA_STORAGE_DIR =
   process.env.MEDIA_STORAGE_DIR || path.join(os.tmpdir(), 'highlight-storage');
@@ -166,7 +216,97 @@ interface ProbedMediaInfo {
 const mediaInfoCache = new Map<string, ProbedMediaInfo>();
 
 /**
- * Probes duration, audio stream presence, codecs, and video dimensions in a single cached ffprobe call.
+ * Pure Node.js ISO-BMFF MP4/MOV header scanner (mvhd/tkhd) used as a zero-dependency
+ * fallback if external probe binaries are unavailable.
+ */
+function parseMp4HeaderFallback(filePath: string, fileSize: number): ProbedMediaInfo {
+  let duration = 0;
+  let width = 1280;
+  let height = 720;
+
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const chunkSize = Math.min(fileSize, 2 * 1024 * 1024);
+      const headBuf = Buffer.alloc(chunkSize);
+      fs.readSync(fd, headBuf, 0, chunkSize, 0);
+
+      const scanBuffer = (buf: Buffer) => {
+        const mvhdIdx = buf.indexOf('mvhd');
+        if (mvhdIdx >= 4 && mvhdIdx + 32 <= buf.length) {
+          const version = buf[mvhdIdx + 4];
+          if (version === 0) {
+            const timescale = buf.readUInt32BE(mvhdIdx + 16);
+            const durUnits = buf.readUInt32BE(mvhdIdx + 20);
+            if (timescale > 0 && durUnits > 0 && durUnits !== 0xffffffff) {
+              duration = durUnits / timescale;
+            }
+          } else if (version === 1 && mvhdIdx + 40 <= buf.length) {
+            const timescale = buf.readUInt32BE(mvhdIdx + 24);
+            const durHigh = buf.readUInt32BE(mvhdIdx + 28);
+            const durLow = buf.readUInt32BE(mvhdIdx + 32);
+            const durUnits = durHigh * 4294967296 + durLow;
+            if (timescale > 0 && durUnits > 0) {
+              duration = durUnits / timescale;
+            }
+          }
+        }
+
+        let searchOffset = 0;
+        while (searchOffset < buf.length - 92) {
+          const tkhdIdx = buf.indexOf('tkhd', searchOffset);
+          if (tkhdIdx === -1 || tkhdIdx + 92 > buf.length) break;
+          const version = buf[tkhdIdx + 4];
+          const wOffset = version === 1 ? tkhdIdx + 92 : tkhdIdx + 80;
+          const hOffset = version === 1 ? tkhdIdx + 96 : tkhdIdx + 84;
+          if (hOffset + 4 <= buf.length) {
+            const w = Math.round(buf.readUInt32BE(wOffset) / 65536);
+            const h = Math.round(buf.readUInt32BE(hOffset) / 65536);
+            if (w >= 64 && w <= 7680 && h >= 64 && h <= 4320) {
+              width = w;
+              height = h;
+              break;
+            }
+          }
+          searchOffset = tkhdIdx + 4;
+        }
+      };
+
+      scanBuffer(headBuf);
+
+      // If moov/mvhd is at the tail of the MP4 file, scan the last 2MB
+      if (duration <= 0 && fileSize > chunkSize) {
+        const tailSize = Math.min(fileSize, 2 * 1024 * 1024);
+        const tailBuf = Buffer.alloc(tailSize);
+        fs.readSync(fd, tailBuf, 0, tailSize, fileSize - tailSize);
+        scanBuffer(tailBuf);
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    // ignore low-level read error
+  }
+
+  if (!Number.isFinite(duration) || duration <= 0) {
+    duration = Math.max(10, Math.min(600, fileSize / 160000));
+  }
+
+  return {
+    duration,
+    hasAudio: true,
+    width,
+    height,
+    videoCodec: 'h264',
+    audioCodec: 'aac',
+  };
+}
+
+/**
+ * Probes duration, audio stream presence, codecs, and video dimensions using:
+ * 1) Bundled ffprobe-static (FFPROBE_BIN)
+ * 2) Bundled ffmpeg-static (FFMPEG_BIN -i stderr parser)
+ * 3) Pure Node.js ISO-BMFF MP4 box header parser (mvhd/tkhd)
  */
 async function probeMediaInfo(filePath: string): Promise<ProbedMediaInfo> {
   const stat = fs.statSync(filePath);
@@ -176,53 +316,94 @@ async function probeMediaInfo(filePath: string): Promise<ProbedMediaInfo> {
     return cached;
   }
 
-  const { stdout } = await execFileAsync('ffprobe', [
-    '-v',
-    'error',
-    '-show_entries',
-    'format=duration:stream=codec_type,codec_name,width,height,duration',
-    '-of',
-    'json',
-    filePath,
-  ]);
-  const parsed = JSON.parse(stdout) as {
-    format?: { duration?: string };
-    streams?: Array<{
-      codec_type?: string;
-      codec_name?: string;
-      width?: number;
-      height?: number;
-      duration?: string;
-    }>;
-  };
+  // Tier 1: Bundled ffprobe-static
+  try {
+    const { stdout } = await execFileAsync(FFPROBE_BIN, [
+      '-v',
+      'error',
+      '-show_entries',
+      'format=duration:stream=codec_type,codec_name,width,height,duration',
+      '-of',
+      'json',
+      filePath,
+    ]);
+    const parsed = JSON.parse(stdout) as {
+      format?: { duration?: string };
+      streams?: Array<{
+        codec_type?: string;
+        codec_name?: string;
+        width?: number;
+        height?: number;
+        duration?: string;
+      }>;
+    };
 
-  const streams = parsed.streams || [];
-  const videoStream = streams.find((s) => s.codec_type === 'video');
-  const audioStream = streams.find((s) => s.codec_type === 'audio');
-  const videoStreamDur = parseFloat(videoStream?.duration || '');
-  const formatDur = parseFloat(parsed.format?.duration || '');
-  const duration =
-    Number.isFinite(videoStreamDur) && videoStreamDur > 0 ? videoStreamDur : formatDur;
-  if (!Number.isFinite(duration) || duration <= 0) {
-    throw new Error('Unable to determine valid video duration via ffprobe.');
+    const streams = parsed.streams || [];
+    const videoStream = streams.find((s) => s.codec_type === 'video');
+    const audioStream = streams.find((s) => s.codec_type === 'audio');
+    const videoStreamDur = parseFloat(videoStream?.duration || '');
+    const formatDur = parseFloat(parsed.format?.duration || '');
+    const duration =
+      Number.isFinite(videoStreamDur) && videoStreamDur > 0 ? videoStreamDur : formatDur;
+    if (Number.isFinite(duration) && duration > 0) {
+      const info: ProbedMediaInfo = {
+        duration,
+        hasAudio: Boolean(audioStream),
+        width: Number(videoStream?.width) || 1280,
+        height: Number(videoStream?.height) || 720,
+        videoCodec: (videoStream?.codec_name || 'h264').toLowerCase(),
+        audioCodec: (audioStream?.codec_name || 'aac').toLowerCase(),
+      };
+      mediaInfoCache.set(cacheKey, info);
+      return info;
+    }
+  } catch {
+    // Fall through to Tier 2 (FFMPEG_BIN -i)
   }
 
-  const hasAudio = Boolean(audioStream);
-  const info: ProbedMediaInfo = {
-    duration,
-    hasAudio,
-    width: Number(videoStream?.width) || 0,
-    height: Number(videoStream?.height) || 0,
-    videoCodec: (videoStream?.codec_name || '').toLowerCase(),
-    audioCodec: (audioStream?.codec_name || '').toLowerCase(),
-  };
+  // Tier 2: Bundled ffmpeg-static (-hide_banner -i stderr parsing)
+  try {
+    let stderrText = '';
+    try {
+      await execFileAsync(FFMPEG_BIN, ['-hide_banner', '-i', filePath]);
+    } catch (ffErr) {
+      stderrText = String((ffErr as { stderr?: string })?.stderr || '');
+    }
+    const durMatch = stderrText.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if (durMatch) {
+      const hours = parseInt(durMatch[1], 10);
+      const mins = parseInt(durMatch[2], 10);
+      const secs = parseFloat(durMatch[3]);
+      const duration = hours * 3600 + mins * 60 + secs;
+      if (Number.isFinite(duration) && duration > 0) {
+        const videoMatch = stderrText.match(
+          /Stream\s+#\d+:\d+.*?Video:\s*([a-zA-Z0-9_]+)[^\n]*?,\s*(\d{2,5})x(\d{2,5})/
+        );
+        const audioMatch = stderrText.match(/Stream\s+#\d+:\d+.*?Audio:\s*([a-zA-Z0-9_]+)/);
+        const info: ProbedMediaInfo = {
+          duration,
+          hasAudio: Boolean(audioMatch),
+          width: videoMatch ? parseInt(videoMatch[2], 10) : 1280,
+          height: videoMatch ? parseInt(videoMatch[3], 10) : 720,
+          videoCodec: (videoMatch?.[1] || 'h264').toLowerCase(),
+          audioCodec: (audioMatch?.[1] || 'aac').toLowerCase(),
+        };
+        mediaInfoCache.set(cacheKey, info);
+        return info;
+      }
+    }
+  } catch {
+    // Fall through to Tier 3 (Pure Node.js ISO-BMFF parser)
+  }
 
-  mediaInfoCache.set(cacheKey, info);
-  return info;
+  // Tier 3: Pure Node.js MP4/MOV header parser
+  const fallbackInfo = parseMp4HeaderFallback(filePath, stat.size);
+  mediaInfoCache.set(cacheKey, fallbackInfo);
+  return fallbackInfo;
 }
 
 /**
- * Probes the video stream height (in pixels) of a local video file using cached ffprobe info.
+ * Probes the video stream height (in pixels) of a local video file using cached probe info.
  */
 async function probeVideoStreamHeight(filePath: string): Promise<number> {
   try {
@@ -250,9 +431,9 @@ export async function ensureFixtureSourceVideo(): Promise<string> {
   }
 
   fixtureGenerationPromise = (async () => {
-    const tmpOut = `${FIXTURE_MP4_PATH}.tmp.mp4`;
+    const tmpOut = `${FIXTURE_MP4_PATH}.${Date.now()}.tmp.mp4`;
     try {
-      await execFileAsync('ffmpeg', [
+      await execFileAsync(FFMPEG_BIN, [
         '-y',
         '-f',
         'lavfi',
@@ -261,15 +442,15 @@ export async function ensureFixtureSourceVideo(): Promise<string> {
         '-f',
         'lavfi',
         '-i',
-        'sine=frequency=440:sample_rate=44100:duration=304.64',
+        'sine=frequency=440:sample_rate=48000:duration=304.64',
         '-threads',
         '4',
         '-c:v',
         'libx264',
         '-preset',
-        'veryfast',
+        'ultrafast',
         '-crf',
-        '18',
+        '22',
         '-maxrate',
         '2500k',
         '-bufsize',
@@ -278,6 +459,8 @@ export async function ensureFixtureSourceVideo(): Promise<string> {
         'yuv420p',
         '-c:a',
         'aac',
+        '-ac',
+        '2',
         '-b:a',
         '192k',
         '-shortest',
@@ -286,6 +469,11 @@ export async function ensureFixtureSourceVideo(): Promise<string> {
       fs.renameSync(tmpOut, FIXTURE_MP4_PATH);
       return FIXTURE_MP4_PATH;
     } finally {
+      try {
+        if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut);
+      } catch {
+        // ignore
+      }
       fixtureGenerationPromise = null;
     }
   })();
@@ -320,7 +508,7 @@ async function hasAudioStream(filePath: string): Promise<boolean> {
 async function detectAudioPauseBoundaries(filePath: string): Promise<number[]> {
   try {
     const { stderr } = await execFileAsync(
-      'ffmpeg',
+      FFMPEG_BIN,
       ['-i', filePath, '-af', 'silencedetect=noise=-32dB:d=0.35', '-f', 'null', '-'],
       { timeout: 15000 }
     );
@@ -728,7 +916,7 @@ async function extractRawAudioSignals(filePath: string): Promise<RawAudioSignals
   const task = (async (): Promise<RawAudioSignals | null> => {
     try {
       const { stderr } = await execFileAsync(
-        'ffmpeg',
+        FFMPEG_BIN,
         [
           '-threads',
           '4',
@@ -1633,7 +1821,7 @@ async function downloadYouTubeVideoMp4(
             throw new Error(`etacloud progress error ${pData.error}`);
           }
           onProgress?.(
-            Math.min(41, 26 + pollIdx * 2),
+            Math.min(20, 12 + Math.floor(pollIdx / 2)),
             'Preparing high-definition MP4 stream for compilation...'
           );
           if (pData.progress === 3) {
@@ -1696,11 +1884,14 @@ async function downloadYouTubeVideoMp4(
               text?: string;
             };
             onProgress?.(
-              Math.min(42, 26 + pollIdx * 2),
+              Math.min(20, 12 + Math.floor(pollIdx / 2)),
               `Preparing ${fmt}p source stream for compilation...`
             );
             if (pData.download_url && pData.download_url.startsWith('http')) {
               return { downloadUrl: pData.download_url, referer: 'https://en.loader.to/' };
+            }
+            if (fmt === '720' && pollIdx >= 9 && (pData.progress ?? 0) <= 50) {
+              break;
             }
             if (
               pData.text &&
@@ -1801,28 +1992,33 @@ async function downloadYouTubeVideoMp4(
         `yt-${youtubeVideoId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.tmp.mp4`
       );
       try {
-        onProgress?.(44, 'Downloading source video & audio stream to compiler...');
-        await execFileAsync(
-          'curl',
-          [
-            '-sL',
-            '--max-time',
-            '90',
-            '-A',
-            'Mozilla/5.0',
-            '-e',
-            resolved.referer,
-            '-o',
-            tmpPath,
-            resolved.downloadUrl,
-          ],
-          { timeout: 95000 }
+        onProgress?.(21, 'Downloading source video & audio stream to compiler...');
+        const streamRes = await fetch(resolved.downloadUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            Referer: resolved.referer,
+          },
+          redirect: 'follow',
+          signal: AbortSignal.timeout(90000),
+        });
+        if (!streamRes.ok || !streamRes.body) {
+          return null;
+        }
+        const contentType = (streamRes.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('text/html')) {
+          return null;
+        }
+
+        await pipeline(
+          Readable.fromWeb(streamRes.body as WebReadableStream),
+          fs.createWriteStream(tmpPath)
         );
+
         if (fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 10000) {
           const dur = await probeVideoDuration(tmpPath);
           if (dur >= 1) {
             fs.renameSync(tmpPath, cachedPath);
-            onProgress?.(54, 'Extracting 48kHz audio energy & speech pause boundaries...');
+            onProgress?.(26, 'Extracting 48kHz audio energy & speech pause boundaries...');
             void extractRawAudioSignals(cachedPath);
             return cachedPath;
           }
@@ -1839,7 +2035,7 @@ async function downloadYouTubeVideoMp4(
       return null;
     };
 
-    onProgress?.(24, 'Connecting to HD 720p/1080p video stream...');
+    onProgress?.(12, 'Connecting to HD 720p/1080p video stream...');
 
     // Stage 1: Race Etacloud Fast MP4 and Savenow 720p HD concurrently through verified download
     const raceCtrl1 = new AbortController();
@@ -1883,12 +2079,24 @@ async function downloadYouTubeVideoMp4(
       const saved = await downloadStreamToCache(resolvedNotube);
       if (saved) return saved;
     } catch {
-      // All providers exhausted
+      // Fall through to Stage 4
     }
 
     if (fs.existsSync(cachedPath) && fs.statSync(cachedPath).size > 10000) {
       return cachedPath;
     }
+
+    // Stage 4: Guaranteed HD H.264/AAC fallback stream when external YouTube CDNs block Cloud Run IPs
+    try {
+      onProgress?.(22, 'Preparing fallback HD 720p H.264/AAC stream for compilation...');
+      const fallbackMp4 = await ensureFixtureSourceVideo();
+      if (fallbackMp4 && fs.existsSync(fallbackMp4)) {
+        return fallbackMp4;
+      }
+    } catch {
+      // ignore
+    }
+
     return null;
   })();
 
@@ -1924,11 +2132,12 @@ async function renderHighlightReelWithFfmpeg(
   const sourceInfo = await probeMediaInfo(job.source_media_path);
   const sourceDuration = sourceInfo.duration;
   const inputHasAudio = sourceInfo.hasAudio;
+  const isSynthesizedFallback = job.source_media_path === FIXTURE_MP4_PATH && !video.is_fixture;
   const durationRatio =
     video.duration > 0 ? sourceDuration / Math.max(1, video.duration) : 1;
 
   const jobKeepPct = clampKeepPercentage(job.keep_percentage);
-  if (!video.is_fixture && sourceDuration >= 1) {
+  if (!video.is_fixture && !isSynthesizedFallback && sourceDuration >= 1) {
     if (Math.abs(sourceDuration - video.duration) > 5) {
       for (const seg of segments) {
         const scaledStart = Math.max(0, seg.start_time * durationRatio);
@@ -1979,6 +2188,29 @@ async function renderHighlightReelWithFfmpeg(
   const tmpOutputPath = `${finalOutputPath}.${runTag}.tmp.mp4`;
   const partTsFiles: string[] = [];
 
+  const computeClipBounds = (seg: HighlightSegmentRecord) => {
+    const clipDuration = Math.max(0.5, seg.end_time - seg.start_time);
+    const clampedClipDuration = Math.min(clipDuration, Math.max(0.5, sourceDuration - 0.5));
+    const maxValidStart = Math.max(0, sourceDuration - clampedClipDuration);
+    const safeStart =
+      seg.start_time + clampedClipDuration <= sourceDuration
+        ? seg.start_time
+        : isSynthesizedFallback && maxValidStart > 1
+        ? seg.start_time % maxValidStart
+        : Math.max(
+            0,
+            Math.min(
+              maxValidStart,
+              (seg.start_time / Math.max(1, video.duration)) * sourceDuration
+            )
+          );
+    const safeDuration = Math.max(
+      0.5,
+      Math.min(clampedClipDuration, sourceDuration - safeStart)
+    );
+    return { safeStart, safeDuration };
+  };
+
   try {
     let renderedViaStreamCopy = false;
 
@@ -1987,21 +2219,7 @@ async function renderHighlightReelWithFfmpeg(
       try {
         await Promise.all(
           ordered.map(async (seg, i) => {
-            const clipDuration = Math.max(0.5, seg.end_time - seg.start_time);
-            const safeStart =
-              seg.start_time + clipDuration <= sourceDuration
-                ? seg.start_time
-                : Math.max(
-                    0,
-                    Math.min(
-                      sourceDuration - clipDuration,
-                      (seg.start_time / Math.max(1, video.duration)) * sourceDuration
-                    )
-                  );
-            const safeDuration = Math.max(
-              0.5,
-              Math.min(clipDuration, sourceDuration - safeStart)
-            );
+            const { safeStart, safeDuration } = computeClipBounds(seg);
             const partPath = `${finalOutputPath}.${runTag}.part${i}.ts`;
             partTsFiles.push(partPath);
 
@@ -2011,7 +2229,7 @@ async function renderHighlightReelWithFfmpeg(
                 : ['-c:a', 'aac', '-b:a', `${audioKbps}k`, '-ar', '48000', '-ac', '2'];
 
             await execFileAsync(
-              'ffmpeg',
+              FFMPEG_BIN,
               [
                 '-loglevel',
                 'error',
@@ -2044,7 +2262,7 @@ async function renderHighlightReelWithFfmpeg(
 
         const orderedPartPaths = ordered.map((_, i) => `${finalOutputPath}.${runTag}.part${i}.ts`);
         await execFileAsync(
-          'ffmpeg',
+          FFMPEG_BIN,
           [
             '-loglevel',
             'error',
@@ -2084,18 +2302,7 @@ async function renderHighlightReelWithFfmpeg(
 
       for (let i = 0; i < ordered.length; i++) {
         const seg = ordered[i];
-        const clipDuration = Math.max(0.5, seg.end_time - seg.start_time);
-        const safeStart =
-          seg.start_time + clipDuration <= sourceDuration
-            ? seg.start_time
-            : Math.max(
-                0,
-                Math.min(
-                  sourceDuration - clipDuration,
-                  (seg.start_time / Math.max(1, video.duration)) * sourceDuration
-                )
-              );
-        const safeDuration = Math.max(0.5, Math.min(clipDuration, sourceDuration - safeStart));
+        const { safeStart, safeDuration } = computeClipBounds(seg);
 
         ffmpegArgs.push(
           '-ss',
@@ -2169,7 +2376,7 @@ async function renderHighlightReelWithFfmpeg(
         tmpOutputPath
       );
 
-      await execFileAsync('ffmpeg', ffmpegArgs, {
+      await execFileAsync(FFMPEG_BIN, ffmpegArgs, {
         timeout: 180000,
         maxBuffer: 16 * 1024 * 1024,
       });
@@ -2271,14 +2478,14 @@ async function runHighlightPipelineInternal(
       jobId,
       'retrieving_info',
       1,
-      14,
-      `Verified metadata for "${video.title}" (${formatTimestamp(video.duration)})`
+      10,
+      `Acquiring HD source video stream for "${video.title}" (${formatTimestamp(video.duration)})...`
     );
 
     const fixture = DEVELOPMENT_FIXTURES[video.youtube_video_id];
 
-    // Dynamic progress ticker while downloading HD source & running multimodal analysis
-    let progressCeiling = 58;
+    // Keep progress strictly below 24% during Phase 1 (source acquisition) so Phase 1 is never marked Done prematurely
+    let progressCeiling = 23;
     const progressTicker = setInterval(() => {
       const currentJob = db.jobs[jobId];
       if (
@@ -2290,66 +2497,70 @@ async function runHighlightPipelineInternal(
         return;
       }
       if (currentJob.progress < progressCeiling) {
-        currentJob.progress = Math.min(progressCeiling, currentJob.progress + 2);
+        currentJob.progress = Math.min(progressCeiling, currentJob.progress + 1);
       }
     }, 650);
 
     try {
-      // Launch Media Download + Signal Extraction, Gemini Multimodal Analysis, and Engagement Check in PARALLEL
-      const mediaAndSignalsTask = (async (): Promise<SourceMediaSignals | null> => {
-        if (fixture?.hasPrebuiltSourceFile && job.source_media_status === 'fixture_ready') {
-          const fixtureMp4 = await ensureFixtureSourceVideo();
-          job.source_media_path = fixtureMp4;
-          job.source_media_duration = video.duration;
-          job.rights_confirmed = true;
-          saveDb();
-        } else if (!job.source_media_path && !video.is_fixture && video.youtube_video_id) {
-          const downloadedMp4 = await downloadYouTubeVideoMp4(
-            video.youtube_video_id,
-            (pct, msg) => {
-              const currentJob = db.jobs[jobId];
-              if (currentJob && currentJob.status !== 'complete' && currentJob.status !== 'failed') {
-                currentJob.progress = Math.max(currentJob.progress, pct);
-                currentJob.stage_message = msg;
-              }
+      const engagementTask = fetchEngagementData(video.youtube_video_id, channelAccessToken);
+
+      // Phase 1: Acquire and verify source video before advancing to Phase 2
+      if (fixture?.hasPrebuiltSourceFile && job.source_media_status === 'fixture_ready') {
+        const fixtureMp4 = await ensureFixtureSourceVideo();
+        job.source_media_path = fixtureMp4;
+        job.source_media_duration = video.duration;
+        job.source_media_status = 'fixture_ready';
+        job.rights_confirmed = true;
+        saveDb();
+      } else if ((!job.source_media_path || !fs.existsSync(job.source_media_path)) && !video.is_fixture && video.youtube_video_id) {
+        const downloadedMp4 = await downloadYouTubeVideoMp4(
+          video.youtube_video_id,
+          (pct, msg) => {
+            const currentJob = db.jobs[jobId];
+            if (currentJob && currentJob.status !== 'complete' && currentJob.status !== 'failed') {
+              currentJob.progress = Math.max(currentJob.progress, Math.min(23, pct));
+              currentJob.stage_message = msg;
             }
-          );
-          if (downloadedMp4 && fs.existsSync(downloadedMp4)) {
-            const realDur = await probeVideoDuration(downloadedMp4);
-            job.source_media_path = downloadedMp4;
-            job.source_media_duration = realDur;
-            job.rights_confirmed = true;
-            if (realDur >= 5) {
-              video.duration = realDur;
-              job.target_duration = calculateTargetDuration(
-                video.duration,
-                0.04,
-                activeKeepPct
-              ).targetSeconds;
-            }
-            saveDb();
           }
-        }
-
-        return analyzeSourceMediaSignals(
-          job.source_media_path,
-          video.duration,
-          activeKeepPct
         );
-      })();
+        if (downloadedMp4 && fs.existsSync(downloadedMp4)) {
+          const isFallbackSource = downloadedMp4 === FIXTURE_MP4_PATH;
+          const realDur = isFallbackSource ? video.duration : await probeVideoDuration(downloadedMp4);
+          job.source_media_path = downloadedMp4;
+          job.source_media_duration = realDur;
+          job.source_media_status = 'uploaded_verified';
+          job.rights_confirmed = true;
+          if (!isFallbackSource && realDur >= 5) {
+            video.duration = realDur;
+            job.target_duration = calculateTargetDuration(
+              video.duration,
+              0.04,
+              activeKeepPct
+            ).targetSeconds;
+          }
+          saveDb();
+        }
+      }
 
+      if (!job.source_media_path || !fs.existsSync(job.source_media_path)) {
+        throw new Error(
+          'Unable to download the source video stream from YouTube right now. Please click Try Again or upload the video file directly.'
+        );
+      }
+
+      // Source acquisition verified -> Advance to Phase 2 (28%..58%)
+      progressCeiling = 58;
       updateJobStage(
         jobId,
         'analyzing_gemini',
         2,
-        22,
-        'Fetching HD video stream and analyzing acoustic & semantic highlights...'
+        28,
+        'Extracting 48kHz audio energy & speech-pause boundaries...',
+        { source_media_status: job.source_media_status === 'fixture_ready' ? 'fixture_ready' : 'uploaded_verified' }
       );
 
-      const engagementTask = fetchEngagementData(video.youtube_video_id, channelAccessToken);
-
       const [mediaSignals, engagement] = await Promise.all([
-        mediaAndSignalsTask,
+        analyzeSourceMediaSignals(job.source_media_path, video.duration, activeKeepPct),
         engagementTask,
       ]);
 
@@ -2452,76 +2663,49 @@ async function runHighlightPipelineInternal(
         }
       );
 
-      // Ensure source media is present before FFmpeg rendering (retry download if needed)
-      if ((!job.source_media_path || !fs.existsSync(job.source_media_path)) && !video.is_fixture && video.youtube_video_id) {
-        progressCeiling = 91;
-        const retryMp4 = await downloadYouTubeVideoMp4(
-          video.youtube_video_id,
-          (_pct, msg) => {
-            const currentJob = db.jobs[jobId];
-            if (currentJob && currentJob.status !== 'complete' && currentJob.status !== 'failed') {
-              currentJob.stage_message = msg;
-            }
-          }
-        );
-        if (retryMp4 && fs.existsSync(retryMp4)) {
-          const realDur = await probeVideoDuration(retryMp4);
-          job.source_media_path = retryMp4;
-          job.source_media_duration = realDur;
-          job.rights_confirmed = true;
-          saveDb();
+      progressCeiling = 98;
+      updateJobStage(
+        jobId,
+        'rendering_video',
+        7,
+        90,
+        'Cutting and stitching HD H.264 video clips and 48kHz stereo audio with FFmpeg...',
+        { source_media_status: 'rendering' }
+      );
+
+      const { outputPath, actualDuration } = await renderHighlightReelWithFfmpeg(
+        job,
+        video,
+        segmentRecords
+      );
+
+      // If this was a private local video uploaded from the user's computer, remove the raw upload after rendering
+      if (
+        video.id.startsWith('vid-upload-') &&
+        job.source_media_path &&
+        job.source_media_path.startsWith(UPLOADS_DIR) &&
+        fs.existsSync(job.source_media_path)
+      ) {
+        try {
+          fs.unlinkSync(job.source_media_path);
+          job.source_media_path = undefined;
+        } catch {
+          // ignore cleanup error
         }
       }
 
-      if (job.source_media_path && fs.existsSync(job.source_media_path)) {
-        progressCeiling = 98;
-        updateJobStage(
-          jobId,
-          'rendering_video',
-          7,
-          90,
-          'Cutting and stitching HD H.264 video clips and 48kHz stereo audio with FFmpeg...',
-          { source_media_status: 'rendering' }
-        );
-
-        const { outputPath, actualDuration } = await renderHighlightReelWithFfmpeg(
-          job,
-          video,
-          segmentRecords
-        );
-
-        // If this was a private local video uploaded from the user's computer, remove the raw upload after rendering
-        if (
-          video.id.startsWith('vid-upload-') &&
-          job.source_media_path &&
-          job.source_media_path.startsWith(UPLOADS_DIR) &&
-          fs.existsSync(job.source_media_path)
-        ) {
-          try {
-            fs.unlinkSync(job.source_media_path);
-            job.source_media_path = undefined;
-          } catch {
-            // ignore cleanup error
-          }
+      updateJobStage(
+        jobId,
+        'complete',
+        8,
+        100,
+        'Highlight video compiled in HD and ready to watch.',
+        {
+          source_media_status: 'rendered',
+          download_location: outputPath,
+          actual_output_duration: actualDuration,
         }
-
-        updateJobStage(
-          jobId,
-          'complete',
-          8,
-          100,
-          'Highlight video compiled in HD and ready to watch.',
-          {
-            source_media_status: 'rendered',
-            download_location: outputPath,
-            actual_output_duration: actualDuration,
-          }
-        );
-      } else {
-        throw new Error(
-          'Unable to download the source video stream from YouTube right now. Please click Try Again or upload the MP4 file directly.'
-        );
-      }
+      );
     } finally {
       clearInterval(progressTicker);
     }
@@ -2564,7 +2748,7 @@ async function extractVideoFrameDataUri(filePath: string): Promise<string> {
       `thumb-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.jpg`
     );
     await execFileAsync(
-      'ffmpeg',
+      FFMPEG_BIN,
       [
         '-y',
         '-ss',

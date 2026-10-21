@@ -247,7 +247,7 @@ export const HeroWorkspace: React.FC<HeroWorkspaceProps> = ({
                 }`}
               >
                 <Upload className="w-3.5 h-3.5" />
-                <span>Upload Local Video (.MP4 / .MOV)</span>
+                <span>Upload Local Video (.MP4, .MOV, .WebM, .MKV)</span>
               </button>
               <span className="hidden md:inline">
                 Stitches real video &amp; audio directly on the server

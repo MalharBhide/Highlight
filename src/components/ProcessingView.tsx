@@ -96,7 +96,9 @@ export const ProcessingView: React.FC<ProcessingViewProps> = ({
         ? 89
         : job.status === 'identifying_moments' || job.status === 'checking_engagement'
         ? 80
-        : 64;
+        : job.status === 'analyzing_gemini'
+        ? 64
+        : 23;
 
     const ticker = setInterval(() => {
       setDisplayProgress((prev) => {
@@ -267,9 +269,18 @@ export const ProcessingView: React.FC<ProcessingViewProps> = ({
             >
               {PIPELINE_PHASES.map((phase, idx) => {
                 const prevThreshold = idx === 0 ? 0 : PIPELINE_PHASES[idx - 1].threshold;
-                const isDone = roundedProgress >= phase.threshold;
+                const sourceAcquired =
+                  (job.stage_index ?? 1) >= 2 ||
+                  Boolean(
+                    job.source_media_status && job.source_media_status !== 'missing_source'
+                  );
+                const isDone =
+                  roundedProgress >= phase.threshold && (phase.id !== 1 || sourceAcquired);
                 const isActive =
-                  !isFailed && roundedProgress >= prevThreshold && roundedProgress < phase.threshold;
+                  !isFailed &&
+                  !isDone &&
+                  roundedProgress >= prevThreshold &&
+                  (idx === 0 || roundedProgress >= prevThreshold);
 
                 return (
                   <div
